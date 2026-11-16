@@ -3,8 +3,10 @@
 //! The binary in `main.rs` is a thin wrapper; everything lives here so
 //! integration tests can run the server in-process.
 
+pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod proxy;
 pub mod status;
 
 use std::future::Future;
@@ -24,11 +26,15 @@ use crate::error::ApiError;
 #[derive(Debug)]
 pub struct AppState {
     pub config: Config,
+    /// One pooled HTTP client shared by all upstream calls.
+    pub http: reqwest::Client,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Arc<Self> {
-        Arc::new(Self { config })
+    /// Fails only if the upstream HTTP client cannot be built (startup error).
+    pub fn new(config: Config) -> Result<Arc<Self>, String> {
+        let http = proxy::build_client()?;
+        Ok(Arc::new(Self { config, http }))
     }
 }
 
@@ -36,7 +42,10 @@ impl AppState {
 /// (non-loopback bind), every path, including `/health` and unknown paths,
 /// is behind the bearer check.
 pub fn app(state: Arc<AppState>) -> Router {
-    let router = Router::new().merge(status::router()).fallback(not_found);
+    let router = Router::new()
+        .merge(status::router())
+        .merge(proxy::router())
+        .fallback(not_found);
     let router = if state.config.client_auth.is_some() {
         router.layer(middleware::from_fn_with_state(
             state.clone(),

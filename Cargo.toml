@@ -8,6 +8,21 @@ publish = false
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 dotenvy = "0.15.7"
+# Stream combinators for passing upstream response chunks through.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+# Upstream HTTP client. `rustls-no-provider` is reqwest 0.13's rustls backend
+# (platform certificate verifier) without a bundled crypto provider; its plain
+# `rustls` feature hardwires aws-lc-rs, whose build needs cmake/NASM on the
+# Windows GNU toolchain. No native-tls/OpenSSL, no http2, no proxy
+# auto-detection from the OS, and no gzip/brotli/deflate/zstd: response
+# bodies must pass through byte-identical.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
+# Not in the PRD crate list (rule 14.6): with `rustls-no-provider`, reqwest
+# needs a rustls crypto provider installed by the application, and only a
+# direct dependency can select `ring` (C/asm built by the `cc` crate with any
+# gcc or MSVC, unlike aws-lc-rs). Same rustls version reqwest already uses;
+# adds no new crates to the tree.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
@@ -15,7 +30,8 @@ toml = "1.2.1"
 
 [dev-dependencies]
 # Same crate as above; `io-util` is only needed by the integration tests to
-# speak raw HTTP/1.1 over a TcpStream (no HTTP client crate until M1).
+# speak raw HTTP/1.1 over a TcpStream. The proxy tests use reqwest (a normal
+# dependency) as their HTTP client and axum for the mock upstream.
 tokio = { version = "1.54.1", default-features = false, features = ["io-util"] }
 
 [profile.release]

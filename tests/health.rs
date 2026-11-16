@@ -1,5 +1,5 @@
 //! Starts the server in-process on an ephemeral port and talks raw HTTP/1.1
-//! to it (no HTTP client crate until M1).
+//! to it, so these checks see exactly what goes over the wire.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -44,7 +44,7 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
-        let state: Arc<AppState> = AppState::new(config);
+        let state: Arc<AppState> = AppState::new(config).unwrap();
         let task = tokio::spawn(sluice::serve(listener, state, async {
             let _ = rx.await;
         }));

@@ -102,7 +102,10 @@ fn run(config_path: PathBuf) -> Result<(), String> {
         .build()
         .map_err(|e| format!("cannot start async runtime: {e}"))?;
 
+    let state = AppState::new(config)?;
+
     runtime.block_on(async move {
+        let config = &state.config;
         let bind = config.bind;
         let listener = tokio::net::TcpListener::bind(bind)
             .await
@@ -114,7 +117,7 @@ fn run(config_path: PathBuf) -> Result<(), String> {
             config.providers.len(),
             config.pools.len()
         );
-        sluice::serve(listener, AppState::new(config), shutdown_signal())
+        sluice::serve(listener, state.clone(), shutdown_signal())
             .await
             .map_err(|e| format!("server error: {e}"))?;
         println!("sluice stopped");

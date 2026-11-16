@@ -12,6 +12,10 @@ pub struct ApiError {
     pub message: String,
     pub kind: &'static str,
     pub code: &'static str,
+    /// Request field the error refers to, rendered as `param`.
+    pub param: Option<&'static str>,
+    /// Close matches for an unknown model, rendered as `suggestions`.
+    pub suggestions: Option<Vec<String>>,
 }
 
 impl ApiError {
@@ -26,7 +30,29 @@ impl ApiError {
             message: message.into(),
             kind,
             code,
+            param: None,
+            suggestions: None,
         }
+    }
+
+    pub fn with_param(mut self, param: &'static str) -> Self {
+        self.param = Some(param);
+        self
+    }
+
+    pub fn with_suggestions(mut self, suggestions: Vec<String>) -> Self {
+        self.suggestions = Some(suggestions);
+        self
+    }
+
+    /// Malformed client request.
+    pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            code,
+            message,
+        )
     }
 
     /// Missing or wrong bearer token.
@@ -50,14 +76,16 @@ impl ApiError {
     }
 
     pub fn body(&self) -> serde_json::Value {
-        json!({
-            "error": {
-                "message": self.message,
-                "type": self.kind,
-                "param": null,
-                "code": self.code,
-            }
-        })
+        let mut error = json!({
+            "message": self.message,
+            "type": self.kind,
+            "param": self.param,
+            "code": self.code,
+        });
+        if let (Some(list), Some(obj)) = (&self.suggestions, error.as_object_mut()) {
+            obj.insert("suggestions".to_string(), json!(list));
+        }
+        json!({ "error": error })
     }
 }
 
@@ -97,6 +125,17 @@ mod tests {
         assert_eq!(
             e.body(),
             json!({"error": {"message": "no such thing", "type": "invalid_request_error", "param": null, "code": "not_found"}})
+        );
+    }
+
+    #[test]
+    fn param_and_suggestions_are_rendered() {
+        let e = ApiError::not_found("unknown model")
+            .with_param("model")
+            .with_suggestions(vec!["coder".to_string()]);
+        assert_eq!(
+            e.body(),
+            json!({"error": {"message": "unknown model", "type": "invalid_request_error", "param": "model", "code": "not_found", "suggestions": ["coder"]}})
         );
     }
 

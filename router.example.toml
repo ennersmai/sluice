@@ -1,0 +1,66 @@
+# sluice example configuration. Copy to router.toml and edit.
+# Secrets (API keys) never go here: they live in .env (see .env.example).
+#
+# Every limit below is 0, meaning "unknown, rely on reactive cooldowns".
+# Copy real numbers from each provider's dashboard; published free-tier
+# numbers go stale. Model ids below are placeholders.
+
+bind = "127.0.0.1:8787"     # non-loopback addresses require ROUTER_API_KEY
+state_file = "state.json"
+max_attempts = 6
+first_byte_timeout_secs = 20
+max_wait_secs = 15          # hold a request this long if a route frees up soon, 0 disables
+private_default = false
+paid_daily_cap_usd = 1.00   # applies to explicit paid requests, 0 blocks paid entirely
+
+[[provider]]
+id = "or-free"
+base_url = "https://openrouter.ai/api/v1"
+keys_env = "OPENROUTER_KEYS"
+paid = false
+trains_on_input = false     # set per provider after reading its terms
+reset_utc_hour = 0
+drop_params = []            # request fields this provider rejects
+models = [                  # allowlist; omit to allow any model
+  "vendor/example-model:free",
+]
+[provider.limits]
+scope = "provider"          # provider | key | key_model
+rpm = 0                     # copy real numbers from the provider dashboard, 0 = unknown
+rpd = 0
+tpm = 0
+tpd = 0
+[provider.model_limits."vendor/example-model:free"]   # optional per-model override
+rpm = 0
+
+[[provider]]
+id = "or-paid"              # paid providers are reachable only by explicit route
+base_url = "https://openrouter.ai/api/v1"
+keys_env = "OPENROUTER_KEYS"
+paid = true
+models = ["vendor/example-paid-model"]
+[provider.prices."vendor/example-paid-model"]
+in_per_mtok = 0.0
+out_per_mtok = 0.0
+
+[[provider]]
+id = "nvidia"
+base_url = "https://integrate.api.nvidia.com/v1"
+keys_env = "NVIDIA_KEYS"
+
+[[provider]]
+id = "groq"
+base_url = "https://api.groq.com/openai/v1"
+keys_env = "GROQ_KEYS"
+
+[[provider]]
+id = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+keys_env = "GEMINI_KEYS"
+trains_on_input = true
+
+# A pool may not contain routes to paid providers.
+[[pool]]
+name = "coder"
+strategy = "priority"       # priority | round_robin | least_used
+routes = ["or-free/vendor/example-model:free", "nvidia/vendor/example-model", "groq/example-model"]

@@ -6,7 +6,9 @@
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod limiter;
 pub mod proxy;
+pub mod select;
 pub mod status;
 
 use std::future::Future;
@@ -28,13 +30,19 @@ pub struct AppState {
     pub config: Config,
     /// One pooled HTTP client shared by all upstream calls.
     pub http: reqwest::Client,
+    /// Cooldowns, breakers, disabled keys and missing routes.
+    pub limiter: limiter::Limiter,
 }
 
 impl AppState {
     /// Fails only if the upstream HTTP client cannot be built (startup error).
     pub fn new(config: Config) -> Result<Arc<Self>, String> {
         let http = proxy::build_client()?;
-        Ok(Arc::new(Self { config, http }))
+        Ok(Arc::new(Self {
+            config,
+            http,
+            limiter: limiter::Limiter::new(),
+        }))
     }
 }
 

@@ -1,13 +1,15 @@
-//! `POST /v1/chat/completions`: resolve the model, rewrite the body and the
-//! headers, call the upstream and pass its response through.
+//! `POST /v1/chat/completions`: resolve the model, pick candidates, call the
+//! upstream with retries and pass its response through.
 //!
-//! M1 scope: one attempt on the first candidate route, no retries, no
-//! failover, no usage capture. Paid routes are refused outright until spend
-//! cap enforcement exists.
+//! Retry loop (PRD section 6): each eligible `(provider, key, model)` entry
+//! is tried in order, up to `max_attempts`, while no byte has gone to the
+//! client. A failure after streaming started cannot fail over: the stream
+//! ends with an SSE `error` event. Paid routes are refused outright until
+//! spend cap enforcement exists.
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -18,11 +20,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use futures_util::future::ready;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use crate::AppState;
-use crate::catalog::{self, Candidate, ResolveError};
+use crate::catalog::{self, ResolveError, RouteKind};
+use crate::config::{ApiKey, Provider, Strategy};
 use crate::error::ApiError;
+use crate::limiter;
+use crate::select::{Entry, Skipped};
 
 /// Request body limit for `/v1/chat/completions`. axum's 2 MB default is far
 /// too small for agent requests that carry large contexts.
@@ -33,6 +38,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest requested model name echoed back in an error message.
 const MAX_ECHOED_MODEL_CHARS: usize = 200;
+
+/// Most upstream error body kept for replaying to the client.
+const MAX_ERROR_BODY_BYTES: usize = 256 * 1024;
 
 pub const HEADER_PROVIDER: &str = "x-router-provider";
 pub const HEADER_UPSTREAM_MODEL: &str = "x-router-upstream-model";
@@ -89,8 +97,40 @@ async fn chat_completions(
     }
 }
 
+/// How an upstream status is handled (PRD section 6 failure table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Success,
+    /// Returned to the client unchanged, no retry, no state change.
+    Passthrough,
+    RateLimited,
+    ServerError,
+    KeyRejected,
+    Missing,
+}
+
+fn classify(status: StatusCode, is_pool: bool) -> Class {
+    match status.as_u16() {
+        200..=299 => Class::Success,
+        429 => Class::RateLimited,
+        500 | 502 | 503 | 504 => Class::ServerError,
+        401..=403 => Class::KeyRejected,
+        404 if is_pool => Class::Missing,
+        _ => Class::Passthrough,
+    }
+}
+
+/// The last retryable upstream error, returned if every attempt fails.
+struct LastError {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+    provider: String,
+    model: String,
+}
+
 async fn forward(
-    state: &AppState,
+    state: &Arc<AppState>,
     client_headers: &HeaderMap,
     body: Result<Bytes, BytesRejection>,
     started: Instant,
@@ -134,8 +174,7 @@ async fn forward(
 
     let resolution =
         catalog::resolve(&state.config, &requested).map_err(|e| model_error(&requested, e))?;
-    // M1: only the first candidate is attempted (failover is M2).
-    let Some(candidate) = resolution.first() else {
+    let Some(first) = resolution.first() else {
         return Err(model_error(
             &requested,
             ResolveError::UnknownModel {
@@ -143,80 +182,353 @@ async fn forward(
             },
         ));
     };
-    let provider = candidate.provider;
 
-    if provider.paid {
+    if first.provider.paid {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "permission_error",
             "paid_route_disabled",
             format!(
                 "provider \"{}\" is paid; paid routes are disabled until spend-cap enforcement is implemented",
-                provider.id
+                first.provider.id
             ),
         )
         .with_param("model"));
     }
 
     let wants_stream = fields.get("stream").and_then(Value::as_bool) == Some(true);
-    fields.insert(
-        "model".to_string(),
-        Value::String(candidate.model.to_string()),
-    );
-    for param in &provider.drop_params {
-        fields.remove(param);
-    }
-    let outgoing = serde_json::to_vec(&request).map_err(|_| internal("cannot encode request"))?;
-
-    let upstream_headers = upstream_request_headers(candidate, client_headers)?;
-    let url = upstream_url(&provider.base_url);
-
-    let overhead = started.elapsed();
-    let upstream = state
-        .http
-        .post(url)
-        .headers(upstream_headers)
-        .body(outgoing)
-        .send()
-        .await
-        .map_err(|_| upstream_unreachable(&provider.id))?;
-
-    let status = upstream.status();
-    let mut headers = forwarded_response_headers(upstream.headers());
-    add_router_headers(&mut headers, candidate, 1, overhead);
-
-    let is_event_stream = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("text/event-stream")
-        });
-
-    let body = if wants_stream || is_event_stream {
-        // Forward chunks as they arrive. A transport error mid-stream ends
-        // the body (the SSE error event is M2). Dropping this body, e.g.
-        // because the client went away, drops the upstream response and so
-        // cancels the upstream request.
-        let chunks = upstream
-            .bytes_stream()
-            .scan((), |_, chunk| ready(chunk.ok()))
-            .map(Ok::<Bytes, Infallible>);
-        Body::from_stream(chunks)
-    } else {
-        let bytes = upstream
-            .bytes()
-            .await
-            .map_err(|_| upstream_unreachable(&provider.id))?;
-        Body::from(bytes)
+    let pool = match resolution.kind {
+        RouteKind::Pool(name) => Some((
+            name,
+            state
+                .config
+                .pool(name)
+                .map_or(Strategy::Priority, |p| p.strategy),
+        )),
+        RouteKind::Explicit => None,
     };
+    let is_pool = pool.is_some();
 
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    Ok(response)
+    let plan = state
+        .limiter
+        .plan(&resolution.candidates, pool, Instant::now());
+    if plan.eligible.is_empty() {
+        return Err(unavailable(&plan.skipped, Instant::now()));
+    }
+
+    let max_attempts = state.config.max_attempts.max(1);
+    let first_byte_timeout = Duration::from_secs(state.config.first_byte_timeout_secs);
+    let mut attempts: u32 = 0;
+    let mut first_overhead: Option<Duration> = None;
+    let mut last: Option<LastError> = None;
+    let mut last_provider = first.provider.id.clone();
+
+    for entry in &plan.eligible {
+        if attempts >= max_attempts {
+            break;
+        }
+        let provider = entry.provider;
+        let Some(key) = provider.keys.get(entry.key_idx) else {
+            continue;
+        };
+        // State may have changed since planning (breaker, disabled key).
+        if state
+            .limiter
+            .skip_reason(&provider.id, entry.key_idx, entry.model, Instant::now())
+            .is_some()
+        {
+            continue;
+        }
+        attempts += 1;
+        last_provider.clone_from(&provider.id);
+
+        let outgoing = encode_request(fields, provider, entry.model)?;
+        let upstream_headers = upstream_request_headers(key, &provider.id, client_headers)?;
+        let url = upstream_url(&provider.base_url);
+        state
+            .limiter
+            .note_request(&provider.id, entry.key_idx, entry.model);
+        let overhead = *first_overhead.get_or_insert_with(|| started.elapsed());
+
+        let send = state
+            .http
+            .post(url)
+            .headers(upstream_headers)
+            .body(outgoing)
+            .send();
+        let upstream = match tokio::time::timeout(first_byte_timeout, send).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) | Err(_) => {
+                apply_failure(state, entry, Class::ServerError, None, "unreachable");
+                continue;
+            }
+        };
+
+        let status = upstream.status();
+        let class = classify(status, is_pool);
+        if !matches!(class, Class::Success | Class::Passthrough) {
+            let retry_after = upstream
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| limiter::parse_retry_after(v, SystemTime::now()));
+            let headers = forwarded_response_headers(upstream.headers());
+            let body = read_capped(upstream).await;
+            apply_failure(state, entry, class, retry_after, status.as_str());
+            last = Some(LastError {
+                status,
+                headers,
+                body,
+                provider: provider.id.clone(),
+                model: entry.model.to_string(),
+            });
+            continue;
+        }
+
+        let mut headers = forwarded_response_headers(upstream.headers());
+        add_router_headers(&mut headers, &provider.id, entry.model, attempts, overhead);
+        let is_event_stream = upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            });
+
+        let body = if wants_stream || is_event_stream {
+            if class == Class::Success {
+                state
+                    .limiter
+                    .record_success(&provider.id, entry.key_idx, entry.model);
+            }
+            Body::from_stream(guarded_stream(state, entry, upstream))
+        } else {
+            match upstream.bytes().await {
+                Ok(bytes) => {
+                    if class == Class::Success {
+                        state
+                            .limiter
+                            .record_success(&provider.id, entry.key_idx, entry.model);
+                    }
+                    Body::from(bytes)
+                }
+                Err(_) if class == Class::Success => {
+                    // Nothing has reached the client yet, so this can fail over.
+                    apply_failure(state, entry, Class::ServerError, None, "body_error");
+                    continue;
+                }
+                Err(_) => return Err(upstream_unreachable(&provider.id)),
+            }
+        };
+
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        return Ok(response);
+    }
+
+    if attempts == 0 {
+        // Every entry went unavailable between planning and attempting.
+        let replan = state
+            .limiter
+            .plan(&resolution.candidates, None, Instant::now());
+        return Err(unavailable(&replan.skipped, Instant::now()));
+    }
+    match last {
+        Some(l) => {
+            let mut headers = l.headers;
+            add_router_headers(
+                &mut headers,
+                &l.provider,
+                &l.model,
+                attempts,
+                first_overhead.unwrap_or_default(),
+            );
+            let mut response = Response::new(Body::from(l.body));
+            *response.status_mut() = l.status;
+            *response.headers_mut() = headers;
+            Ok(response)
+        }
+        None => Err(upstream_unreachable(&last_provider)),
+    }
+}
+
+/// Serialise the request for one entry: `model` rewritten, the provider's
+/// `drop_params` removed. Dropped fields are put back afterwards so the next
+/// attempt (another provider) starts from the original body.
+fn encode_request(
+    fields: &mut Map<String, Value>,
+    provider: &Provider,
+    model: &str,
+) -> Result<Vec<u8>, ApiError> {
+    fields.insert("model".to_string(), Value::String(model.to_string()));
+    let removed: Vec<(&String, Value)> = provider
+        .drop_params
+        .iter()
+        .filter_map(|p| fields.remove(p).map(|v| (p, v)))
+        .collect();
+    let encoded = serde_json::to_vec(&*fields);
+    for (name, value) in removed {
+        fields.insert(name.clone(), value);
+    }
+    encoded.map_err(|_| internal("cannot encode request"))
+}
+
+/// Read an error body, keeping at most [`MAX_ERROR_BODY_BYTES`].
+async fn read_capped(mut response: reqwest::Response) -> Bytes {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
+        buf.extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+        if buf.len() >= MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    Bytes::from(buf)
+}
+
+/// Record a retryable failure in the limiter and log the warnings.
+fn apply_failure(
+    state: &AppState,
+    entry: &Entry<'_>,
+    class: Class,
+    retry_after: Option<Duration>,
+    detail: &str,
+) {
+    let provider = entry.provider.id.as_str();
+    let model = entry.model;
+    let key = entry
+        .provider
+        .keys
+        .get(entry.key_idx)
+        .map_or_else(|| "?".to_string(), ApiKey::redacted);
+    let now = Instant::now();
+    match class {
+        Class::RateLimited => {
+            let len =
+                state
+                    .limiter
+                    .record_rate_limit(provider, entry.key_idx, model, retry_after, now);
+            eprintln!(
+                "warn: cooldown provider={provider} key={key} model={model} for {}s (429)",
+                len.as_secs()
+            );
+        }
+        Class::ServerError => {
+            if state.limiter.record_server_failure(provider, now) {
+                eprintln!(
+                    "warn: circuit breaker open provider={provider} for {}s (last failure: {detail})",
+                    limiter::BREAKER_OPEN.as_secs()
+                );
+            }
+        }
+        Class::KeyRejected => {
+            if state.limiter.disable_key(provider, entry.key_idx) {
+                eprintln!(
+                    "error: key disabled until restart provider={provider} key={key} (upstream {detail})"
+                );
+            }
+        }
+        Class::Missing => {
+            if state.limiter.mark_missing(provider, model) {
+                eprintln!("warn: model missing provider={provider} model={model} (upstream 404)");
+            }
+        }
+        Class::Success | Class::Passthrough => {}
+    }
+}
+
+/// Forward the upstream body as it arrives. If the upstream fails mid-stream
+/// the client gets one final SSE `error` event and the stream ends (no retry,
+/// the failure counts toward the provider's breaker). Dropping the body, e.g.
+/// because the client went away, drops the upstream response and so cancels
+/// the upstream request.
+fn guarded_stream(
+    state: &Arc<AppState>,
+    entry: &Entry<'_>,
+    upstream: reqwest::Response,
+) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> + use<> {
+    let state = Arc::clone(state);
+    let provider = entry.provider.id.clone();
+    let error_event = Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "upstream_stream_interrupted",
+            format!("provider \"{provider}\" dropped the stream before it finished"),
+        )
+        .body()
+    ));
+    upstream.bytes_stream().scan(false, move |failed, chunk| {
+        if *failed {
+            return ready(None);
+        }
+        ready(match chunk {
+            Ok(bytes) => Some(Ok(bytes)),
+            Err(_) => {
+                *failed = true;
+                if state
+                    .limiter
+                    .record_server_failure(&provider, Instant::now())
+                {
+                    eprintln!(
+                        "warn: circuit breaker open provider={provider} for {}s (stream failure)",
+                        limiter::BREAKER_OPEN.as_secs()
+                    );
+                }
+                eprintln!("warn: stream interrupted provider={provider}");
+                Some(Ok(error_event.clone()))
+            }
+        })
+    })
+}
+
+/// 503 listing every skipped route with its reason. `Retry-After` is the
+/// time until the earliest cooldown or breaker expiry, when there is one.
+fn unavailable(skipped: &[Skipped], now: Instant) -> ApiError {
+    let routes: Vec<Value> = skipped
+        .iter()
+        .map(|s| {
+            let mut v = json!({"route": s.route, "reason": s.reason.name()});
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(key) = &s.key {
+                    obj.insert("key".to_string(), json!(key));
+                }
+                if let Some(until) = s.reason.until() {
+                    obj.insert(
+                        "retry_after_secs".to_string(),
+                        json!(secs_until(until, now)),
+                    );
+                }
+            }
+            v
+        })
+        .collect();
+    let earliest = skipped
+        .iter()
+        .filter_map(|s| s.reason.until())
+        .min()
+        .map(|u| secs_until(u, now));
+    let error = ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "upstream_error",
+        "no_route_available",
+        "no route is available for this model right now",
+    )
+    .with_routes(Value::Array(routes));
+    match earliest {
+        Some(secs) => error.with_retry_after(u32::try_from(secs).unwrap_or(u32::MAX)),
+        None => error,
+    }
+}
+
+/// Whole seconds until `until`, rounded up, at least 1.
+fn secs_until(until: Instant, now: Instant) -> u64 {
+    let d = until.saturating_duration_since(now);
+    (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
 }
 
 /// `{base_url}/chat/completions`, tolerating a trailing slash on `base_url`.
@@ -228,18 +540,14 @@ fn upstream_url(base_url: &str) -> String {
 /// (the client's own key never reaches a provider), plus `content-type` and
 /// the client's `accept`. Nothing else from the client is forwarded.
 fn upstream_request_headers(
-    candidate: Candidate<'_>,
+    key: &ApiKey,
+    provider_id: &str,
     client_headers: &HeaderMap,
 ) -> Result<HeaderMap, ApiError> {
-    let provider = candidate.provider;
-    let key = provider
-        .keys
-        .first()
-        .ok_or_else(|| internal("provider has no API key"))?;
     let mut auth = HeaderValue::from_str(&format!("Bearer {}", key.expose())).map_err(|_| {
         internal(format!(
             "API key for provider \"{}\" contains characters not allowed in an HTTP header",
-            provider.id
+            provider_id
         ))
     })?;
     auth.set_sensitive(true);
@@ -285,19 +593,14 @@ fn forwarded_response_headers(upstream: &HeaderMap) -> HeaderMap {
 
 fn add_router_headers(
     headers: &mut HeaderMap,
-    candidate: Candidate<'_>,
+    provider_id: &str,
+    model: &str,
     attempts: u32,
     overhead: Duration,
 ) {
     let values = [
-        (
-            HEADER_PROVIDER,
-            HeaderValue::from_str(&candidate.provider.id),
-        ),
-        (
-            HEADER_UPSTREAM_MODEL,
-            HeaderValue::from_str(candidate.model),
-        ),
+        (HEADER_PROVIDER, HeaderValue::from_str(provider_id)),
+        (HEADER_UPSTREAM_MODEL, HeaderValue::from_str(model)),
         (
             HEADER_ATTEMPTS,
             HeaderValue::from_str(&attempts.to_string()),

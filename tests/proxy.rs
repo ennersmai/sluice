@@ -36,6 +36,12 @@ enum Reply {
         headers: Vec<(&'static str, &'static str)>,
         body: Vec<u8>,
     },
+    /// Reply `n` to call `n` (the last one repeats).
+    Sequence(Vec<Reply>),
+    /// Wait before replying.
+    Delayed(Duration, Box<Reply>),
+    /// Stream chunks, then abort the connection mid-body.
+    StreamThenAbort(Vec<(Duration, Vec<u8>)>),
     /// `text/event-stream` body: each chunk is sent after its delay.
     Stream(Vec<(Duration, Vec<u8>)>),
 }
@@ -130,12 +136,51 @@ async fn mock_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    m.captured.lock().unwrap().push(Captured {
-        path: uri.path().to_string(),
-        headers,
-        body,
-    });
-    match m.reply {
+    let n = {
+        let mut calls = m.captured.lock().unwrap();
+        calls.push(Captured {
+            path: uri.path().to_string(),
+            headers,
+            body,
+        });
+        calls.len() - 1
+    };
+    let mut reply = m.reply.clone();
+    loop {
+        match reply {
+            Reply::Sequence(list) => {
+                reply = list[n.min(list.len() - 1)].clone();
+            }
+            Reply::Delayed(wait, inner) => {
+                tokio::time::sleep(wait).await;
+                reply = *inner;
+            }
+            other => {
+                reply = other;
+                break;
+            }
+        }
+    }
+    match reply {
+        Reply::Sequence(_) | Reply::Delayed(..) => unreachable!(),
+        Reply::StreamThenAbort(chunks) => {
+            let stream = futures_util::stream::unfold(chunks.into_iter(), |mut it| async move {
+                match it.next() {
+                    Some((gap, chunk)) => {
+                        tokio::time::sleep(gap).await;
+                        Some((Ok::<_, std::io::Error>(Bytes::from(chunk)), it))
+                    }
+                    None => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Some((Err(std::io::Error::other("upstream dropped")), it))
+                    }
+                }
+            });
+            let mut r = Response::new(Body::from_stream(stream));
+            r.headers_mut()
+                .insert("content-type", "text/event-stream".parse().unwrap());
+            r
+        }
         Reply::Full {
             status,
             headers,
@@ -183,8 +228,14 @@ async fn closed_addr() -> SocketAddr {
 /// Config with providers `alpha` (allowlist), `beta` (no allowlist) and the
 /// paid `money`, pointing at the given base URLs, plus pool `coder`.
 fn config(alpha: &str, beta: &str, extra: &str) -> Config {
+    config_full("", alpha, beta, extra, ALPHA_KEY)
+}
+
+/// Like `config`, with top-level settings and alpha's `ALPHA_KEYS` value.
+fn config_full(top: &str, alpha: &str, beta: &str, extra: &str, alpha_keys: &str) -> Config {
     let text = format!(
         r#"
+{top}
 [[provider]]
 id = "alpha"
 base_url = "{alpha}"
@@ -210,7 +261,7 @@ routes = ["alpha/vendor/model-a", "beta/fallback-model"]
 "#
     );
     let env: HashMap<&str, &str> = [
-        ("ALPHA_KEYS", ALPHA_KEY),
+        ("ALPHA_KEYS", alpha_keys),
         ("BETA_KEYS", BETA_KEY),
         ("PAID_KEYS", PAID_KEY),
     ]
@@ -614,7 +665,11 @@ async fn upstream_error_statuses_pass_through_unchanged() {
         })
         .await;
         let router = start_router(config(&alpha.base_url(), "http://127.0.0.1:9/v1", "")).await;
-        for stream in [false, true] {
+        // Retryable statuses with one key and no other route are returned once
+        // (the last upstream error); the route is then cooling or disabled.
+        let retryable = [401, 429, 500, 503].contains(&status);
+        let streams: &[bool] = if retryable { &[false] } else { &[false, true] };
+        for &stream in streams {
             let r = post_json(
                 router,
                 &json!({"model": "alpha/vendor/model-a", "stream": stream, "messages": []}),
@@ -626,8 +681,7 @@ async fn upstream_error_statuses_pass_through_unchanged() {
             assert_eq!(header(&r, "x-router-attempts"), "1");
             assert_eq!(r.bytes().await.unwrap(), body.as_bytes(), "{status}");
         }
-        // No retries in M1.
-        assert_eq!(alpha.calls().len(), 2);
+        assert_eq!(alpha.calls().len(), streams.len());
     }
 }
 
@@ -676,18 +730,18 @@ async fn explicit_model_with_extra_slashes_is_passed_verbatim() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pool_resolves_to_its_first_route_only() {
+async fn pool_fails_over_to_next_route_on_500() {
     let alpha = Mock::start(Reply::json(500, "{\"error\":\"down\"}")).await;
     let beta = Mock::start(Reply::json(200, "{}")).await;
     let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
 
     let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
-    // M1 attempts only the first route: no failover to beta.
-    assert_eq!(r.status(), 500);
-    assert_eq!(header(&r, "x-router-provider"), "alpha");
-    assert_eq!(header(&r, "x-router-upstream-model"), "vendor/model-a");
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-upstream-model"), "fallback-model");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
     assert_eq!(alpha.only_call().json()["model"], "vendor/model-a");
-    assert!(beta.calls().is_empty());
+    assert_eq!(beta.only_call().json()["model"], "fallback-model");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -781,4 +835,210 @@ async fn client_disconnect_drops_the_upstream_stream() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(alpha.emitted().len() < 100);
+}
+
+// ---------------------------------------------------------------------------
+// M2: pools, retries, cooldowns, breaker, missing routes (T4-T9, T12, T21)
+// ---------------------------------------------------------------------------
+
+const SSE_CHUNK: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+
+fn auth_of(c: &Captured) -> String {
+    c.headers["authorization"].to_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t4_429_with_retry_after_fails_over_and_cools_the_route() {
+    let alpha = Mock::start(Reply::Full {
+        status: 429,
+        headers: vec![("content-type", "application/json"), ("retry-after", "30")],
+        body: b"{\"error\":\"slow\"}".to_vec(),
+    })
+    .await;
+    let beta = Mock::start(Reply::json(200, "{\"ok\":true}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let ask = || async move { post_json(router, &json!({"model": "coder", "messages": []})).await };
+
+    let r = ask().await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+
+    // Cooling: alpha is not contacted again. (The exact 30 s expiry is
+    // asserted in the limiter unit tests.)
+    let r = ask().await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-attempts"), "1");
+    assert_eq!(alpha.calls().len(), 1);
+    assert_eq!(beta.calls().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t6_first_byte_timeout_fails_over() {
+    let alpha = Mock::start(Reply::Delayed(
+        Duration::from_secs(4),
+        Box::new(Reply::json(200, "{\"slow\":true}")),
+    ))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{\"fast\":true}")).await;
+    let router = start_router(config_full(
+        "first_byte_timeout_secs = 1",
+        &alpha.base_url(),
+        &beta.base_url(),
+        "",
+        ALPHA_KEY,
+    ))
+    .await;
+
+    let started = Instant::now();
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(r.bytes().await.unwrap(), "{\"fast\":true}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t7_mid_stream_drop_emits_sse_error_event_and_does_not_retry() {
+    let alpha = Mock::start(Reply::StreamThenAbort(vec![(
+        Duration::from_millis(10),
+        SSE_CHUNK.to_vec(),
+    )]))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+
+    let r = post_json(
+        router,
+        &json!({"model": "coder", "stream": true, "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+    let text = r.text().await.unwrap();
+    assert!(text.starts_with(std::str::from_utf8(SSE_CHUNK).unwrap()));
+    let (_, tail) = text.split_once("event: error\ndata: ").expect(&text);
+    let data: Value = serde_json::from_str(tail.trim_end()).unwrap();
+    assert_eq!(data["error"]["type"], "upstream_error");
+    assert!(data["error"]["message"].is_string());
+    assert_eq!(alpha.calls().len(), 1);
+    assert!(
+        beta.calls().is_empty(),
+        "must not retry after streaming began"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t8_401_disables_the_key_and_the_next_key_is_used() {
+    let alpha = Mock::start(Reply::Sequence(vec![
+        Reply::json(401, "{\"error\":\"bad key\"}"),
+        Reply::json(200, "{\"ok\":true}"),
+    ]))
+    .await;
+    let keys = format!("{ALPHA_KEY},{BETA_KEY}");
+    let router = start_router(config_full(
+        "",
+        &alpha.base_url(),
+        "http://127.0.0.1:9/v1",
+        "",
+        &keys,
+    ))
+    .await;
+    let ask = || async move {
+        let body = json!({"model": "alpha/vendor/model-a", "messages": []});
+        post_json(router, &body).await
+    };
+
+    let r = ask().await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    let first = alpha.calls();
+    let rejected = auth_of(&first[0]);
+    let accepted = auth_of(&first[1]);
+    assert_ne!(rejected, accepted);
+
+    // The rejected key is never used again, whatever the rotation says.
+    for _ in 0..3 {
+        assert_eq!(ask().await.status(), 200);
+    }
+    let calls = alpha.calls();
+    assert_eq!(calls.len(), 5);
+    assert!(calls[2..].iter().all(|c| auth_of(c) == accepted));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t9_400_is_returned_unchanged_without_retry_or_cooldown() {
+    let body = "{\"error\":{\"message\":\"bad param\"}}";
+    let alpha = Mock::start(Reply::json(400, body)).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+
+    for _ in 0..2 {
+        let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+        assert_eq!(r.status(), 400);
+        assert_eq!(header(&r, "x-router-attempts"), "1");
+        assert_eq!(r.bytes().await.unwrap(), body.as_bytes());
+    }
+    // No cooldown: the second request went to alpha again; beta never used.
+    assert_eq!(alpha.calls().len(), 2);
+    assert!(beta.calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t12_all_routes_cooling_gives_503_with_reasons_and_retry_after() {
+    let rate_limited = |secs: &'static str| Reply::Full {
+        status: 429,
+        headers: vec![("content-type", "application/json"), ("retry-after", secs)],
+        body: b"{\"error\":\"slow\"}".to_vec(),
+    };
+    let alpha = Mock::start(rate_limited("30")).await;
+    let beta = Mock::start(rate_limited("60")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let ask = || async move { post_json(router, &json!({"model": "coder", "messages": []})).await };
+
+    // Every attempt fails with a retryable error: last upstream error returned.
+    let r = ask().await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+
+    let r = ask().await;
+    assert_eq!(r.status(), 503);
+    let retry_after: u64 = header(&r, "retry-after").parse().unwrap();
+    assert!((29..=30).contains(&retry_after), "{retry_after}");
+    let v = error_body(r).await;
+    let routes = v["error"]["routes"].as_array().unwrap();
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0]["route"], "alpha/vendor/model-a");
+    assert_eq!(routes[0]["reason"], "cooldown");
+    assert_eq!(routes[1]["route"], "beta/fallback-model");
+    assert_eq!(routes[1]["reason"], "cooldown");
+    assert!(routes[1]["retry_after_secs"].as_u64().unwrap() > 30);
+    assert_eq!(alpha.calls().len(), 1);
+    assert_eq!(beta.calls().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t21_404_on_a_pool_route_marks_it_missing_and_the_next_route_serves() {
+    let alpha = Mock::start(Reply::json(404, "{\"error\":\"model gone\"}")).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+
+    for expected_attempts in ["2", "1"] {
+        let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(header(&r, "x-router-provider"), "beta");
+        assert_eq!(header(&r, "x-router-attempts"), expected_attempts);
+    }
+    assert_eq!(alpha.calls().len(), 1, "missing route is not retried");
+
+    // On an explicit route a 404 goes back to the client, nothing is marked.
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/some-model:free", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 404);
+    assert_eq!(alpha.calls().len(), 2);
 }

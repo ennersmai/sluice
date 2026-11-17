@@ -16,6 +16,10 @@ pub struct ApiError {
     pub param: Option<&'static str>,
     /// Close matches for an unknown model, rendered as `suggestions`.
     pub suggestions: Option<Vec<String>>,
+    /// Per-route skip reasons for a 503, rendered as `routes`.
+    pub routes: Option<Box<serde_json::Value>>,
+    /// Seconds for a `Retry-After` response header.
+    pub retry_after: Option<u32>,
 }
 
 impl ApiError {
@@ -32,6 +36,8 @@ impl ApiError {
             code,
             param: None,
             suggestions: None,
+            routes: None,
+            retry_after: None,
         }
     }
 
@@ -75,6 +81,16 @@ impl ApiError {
         )
     }
 
+    pub fn with_routes(mut self, routes: serde_json::Value) -> Self {
+        self.routes = Some(Box::new(routes));
+        self
+    }
+
+    pub fn with_retry_after(mut self, secs: u32) -> Self {
+        self.retry_after = Some(secs);
+        self
+    }
+
     pub fn body(&self) -> serde_json::Value {
         let mut error = json!({
             "message": self.message,
@@ -82,6 +98,9 @@ impl ApiError {
             "param": self.param,
             "code": self.code,
         });
+        if let (Some(routes), Some(obj)) = (&self.routes, error.as_object_mut()) {
+            obj.insert("routes".to_string(), (**routes).clone());
+        }
         if let (Some(list), Some(obj)) = (&self.suggestions, error.as_object_mut()) {
             obj.insert("suggestions".to_string(), json!(list));
         }
@@ -106,6 +125,11 @@ impl std::error::Error for ApiError {}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut response = (self.status, Json(self.body())).into_response();
+        if let Some(secs) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
         if self.status == StatusCode::UNAUTHORIZED {
             response
                 .headers_mut()

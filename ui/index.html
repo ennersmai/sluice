@@ -5,88 +5,165 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sluice</title>
 <style>
-:root{--bg:#0f1216;--panel:#171b21;--panel2:#1e242c;--line:#2a323c;--fg:#d8dee6;--dim:#8a95a3;--ok:#3fb56b;--warn:#e0a52e;--bad:#e5534b;--info:#4c9be8;--paused:#7d8794}
+:root{
+  --bg:#0c0f13;--surface:#13181f;--surface2:#1a212a;--line:#242c37;--line2:#323c4a;
+  --fg:#d9e0e8;--dim:#8794a4;--faint:#5c6877;
+  --ok:#3ecf7a;--cooling:#e6a935;--bad:#ef5b53;--paused:#7a8594;--missing:#b47ae6;--info:#5aa2f0;
+  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--r:6px;
+  --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-header{display:flex;flex-wrap:wrap;gap:8px 22px;align-items:center;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
-header h1{font-size:16px;margin:0 6px 0 0;letter-spacing:.5px}
-.stat{display:flex;flex-direction:column}
-.stat b{font-size:15px;font-weight:600}
-.stat span{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
-#conn{margin-left:auto;color:var(--dim)}
-main{padding:16px 20px;max-width:1500px;margin:0 auto}
-h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin:22px 0 8px}
-#providers{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px}
-.card .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.card .name{font-weight:600;font-size:14px}
-.tag{font-size:10px;padding:1px 6px;border-radius:3px;border:1px solid var(--line);color:var(--dim)}
-.tag.paid{color:var(--warn);border-color:var(--warn)}
-.pill{margin-left:auto;font-size:11px;padding:2px 8px;border-radius:10px;background:var(--panel2);border:1px solid var(--line)}
-.pill.ok{color:var(--ok);border-color:var(--ok)}
-.pill.cooling{color:var(--warn);border-color:var(--warn)}
-.pill.breaker_open,.pill.key_disabled{color:var(--bad);border-color:var(--bad)}
-.pill.paused,.pill.missing{color:var(--paused)}
-.bar{margin:8px 0 0}
-.bar .lbl{display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
-.bar .track{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:2px}
-.bar .fill{height:100%;background:var(--info)}
-.bar .fill.warn{background:var(--warn)}
-.bar .fill.bad{background:var(--bad)}
-.kv{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px;color:var(--dim)}
-.kv b{color:var(--fg);font-weight:500}
-.err{margin-top:8px;color:var(--bad);font-size:12px;word-break:break-word}
-.note{margin-top:6px;color:var(--warn);font-size:12px}
-.btns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
-button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:3px 10px;font:inherit;cursor:pointer}
-button:hover{border-color:var(--info)}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase}
-.models{margin-top:8px;font-size:12px}
-.models td,.models th{padding:3px 6px}
-#live{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow-x:auto}
+html{color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
+.st-ok{--c:var(--ok)}.st-cooling{--c:var(--cooling)}.st-breaker_open,.st-key_disabled{--c:var(--bad)}
+.st-paused{--c:var(--paused)}.st-missing{--c:var(--missing)}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:var(--s4);padding:var(--s3) var(--s5);background:rgba(19,24,31,.96);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0;letter-spacing:.3px;font-weight:650}
+.ver{color:var(--faint);font-family:var(--mono);font-size:11px}
+.hstat{color:var(--dim);font-size:12px}
+.hstat b{color:var(--fg);font-weight:500}
+#conn{margin-left:auto;display:flex;align-items:center;gap:var(--s2);color:var(--dim);font-size:12px}
+#conn i{width:8px;height:8px;border-radius:50%;background:var(--paused)}
+#conn.up i{background:var(--ok);box-shadow:0 0 0 3px rgba(62,207,122,.18)}
+#conn.down i{background:var(--bad);animation:pulse 1s ease-in-out infinite}
+main{padding:var(--s4) var(--s5) var(--s5);max-width:1600px;margin:0 auto}
+h2{display:flex;align-items:center;gap:var(--s3);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);margin:var(--s5) 0 var(--s2)}
+h2 .right{margin-left:auto;display:flex;gap:var(--s2);align-items:center;text-transform:none;letter-spacing:0;font-weight:400}
+.dim{color:var(--dim)}.faint{color:var(--faint)}
+.mono{font-family:var(--mono);font-size:12px}
 .num{text-align:right;white-space:nowrap}
-.chip{display:inline-block;margin:1px 4px 1px 0;padding:0 7px;border-radius:9px;border:1px solid var(--line);font-size:12px;white-space:nowrap}
+button,input{font:inherit;color:var(--fg)}
+button{background:var(--surface2);border:1px solid var(--line2);border-radius:4px;padding:3px 10px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--info)}
+button:disabled{opacity:.55;cursor:default}
+button.on{background:#1d2b3c;border-color:var(--info);color:#fff}
+input{background:var(--bg);border:1px solid var(--line2);border-radius:4px;padding:3px 8px;width:190px}
+input:focus{outline:1px solid var(--info);border-color:var(--info)}
+/* summary */
+#tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:var(--s3)}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:var(--s3) var(--s4)}
+.tile .l{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.tile .v{font-size:22px;font-weight:600;line-height:1.25;margin-top:2px}
+.tile .sub{color:var(--faint);font-size:11px;min-height:15px}
+.tile.ok .v{color:var(--ok)}.tile.warn .v{color:var(--cooling)}.tile.bad .v{color:var(--bad)}
+/* pills, chips, tags */
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--c,var(--line2));color:var(--c,var(--dim));white-space:nowrap}
+.pill:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--c,var(--dim))}
+.tag{font-size:10px;padding:0 6px;border-radius:3px;border:1px solid var(--line2);color:var(--dim);white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
+.tag.paid{color:var(--cooling);border-color:var(--cooling)}
+.tag.next{color:var(--ok);border-color:var(--ok)}
+.chip{display:inline-block;margin:1px 4px 1px 0;padding:0 8px;border-radius:9px;border:1px solid var(--line2);font-size:12px;white-space:nowrap}
 .chip.fail{color:var(--bad);border-color:var(--bad)}
 .chip.ok{color:var(--ok);border-color:var(--ok)}
 .chip.pending{color:var(--info);border-color:var(--info);animation:pulse 1.2s ease-in-out infinite}
-tr.inflight td{background:#16222f}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--info);margin-right:6px;animation:pulse 1.2s ease-in-out infinite}
-@keyframes pulse{50%{opacity:.25}}
-.dim{color:var(--dim)}
-#chartbox{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px}
+@keyframes pulse{50%{opacity:.3}}
+/* pools */
+#pools{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:var(--s3)}
+.pool{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:var(--s3) var(--s4)}
+.pool .ph{display:flex;align-items:baseline;gap:var(--s2);margin-bottom:var(--s2)}
+.pool .pn{font-weight:600;font-size:14px}
+.pool .pnext{margin-left:auto;font-size:11px;color:var(--dim)}
+.route{display:flex;align-items:center;gap:var(--s2);padding:5px 0;border-top:1px solid var(--line)}
+.route .ix{width:16px;color:var(--faint);font-size:11px;text-align:right}
+.route .rn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12px}
+.route.next{background:linear-gradient(90deg,rgba(62,207,122,.09),transparent 70%)}
+.route.off .rn{color:var(--dim)}
+/* providers */
+#providers{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:var(--s3)}
+.card{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--c,var(--line2));border-radius:var(--r);padding:var(--s3) var(--s4)}
+.card .head{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+.card .sw{width:10px;height:10px;border-radius:3px}
+.card .name{font-weight:600;font-size:14px}
+.card .head .pill{margin-left:auto}
+.bars{display:grid;grid-template-columns:1fr 1fr;gap:var(--s2) var(--s4);margin-top:var(--s3)}
+.bar .lbl{display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
+.bar .lbl b{color:var(--fg);font-weight:500}
+.bar .track{height:5px;background:var(--surface2);border-radius:3px;overflow:hidden;margin-top:3px}
+.bar .fill{height:100%;width:0;background:var(--info);transition:width .3s}
+.bar .fill.warn{background:var(--cooling)}.bar .fill.bad{background:var(--bad)}
+.bar.nolim .track{display:none}
+.stats{display:flex;align-items:flex-end;gap:var(--s4);margin-top:var(--s3);flex-wrap:wrap}
+.stats .s .l{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.4px}
+.stats .s .v{font-size:14px;font-weight:550}
+.spark{margin-left:auto;width:120px;height:30px}
+.notes{margin-top:var(--s2)}
+.note{font-size:12px;color:var(--cooling);word-break:break-word}
+.note.p{color:var(--missing)}
+.err{margin-top:var(--s2);font-size:12px;color:var(--bad);word-break:break-word}
+.btns{display:flex;align-items:center;gap:var(--s2);margin-top:var(--s3);flex-wrap:wrap}
+.fb{font-size:12px;color:var(--dim)}.fb.ok{color:var(--ok)}.fb.bad{color:var(--bad)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:5px var(--s2);border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
+th.num,td.num{text-align:right}
+.models{margin-top:var(--s2);font-size:12px}
+.models td,.models th{padding:3px 6px}
+/* live */
+#live{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow-x:auto}
+#live tr.row{cursor:pointer}
+#live tr.row:hover td{background:var(--surface2)}
+#live tr.inflight td{background:#14202e}
+#live tr.open td{background:var(--surface2)}
+#live td.model{max-width:230px;overflow:hidden;text-overflow:ellipsis}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--info);margin-right:6px;animation:pulse 1.1s ease-in-out infinite}
+.s2{color:var(--ok)}.s4{color:var(--bad)}.s0{color:var(--info)}
+tr.detail>td{padding:var(--s3) var(--s4) var(--s4);background:var(--bg)}
+.dgrid{display:flex;flex-wrap:wrap;gap:var(--s2) var(--s5);margin-bottom:var(--s3)}
+.dgrid .l{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.4px}
+.dgrid .v{font-size:13px}
+table.att{width:auto;min-width:520px}
+.empty{padding:var(--s4);color:var(--dim)}
+/* chart */
+#chartbox{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:var(--s3) var(--s4)}
 #chartbox svg{width:100%;height:auto;display:block}
-#legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px}
-#legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+#legend{display:flex;flex-wrap:wrap;gap:var(--s1) var(--s4);margin-top:var(--s2);color:var(--dim)}
+#legend i,.tip i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}
+.tip{position:absolute;pointer-events:none;z-index:4;background:#0a0d11;border:1px solid var(--line2);border-radius:var(--r);padding:var(--s2) var(--s3);font-size:12px;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+.tip .th{color:var(--dim);margin-bottom:3px}
+.tip .tr{display:flex;gap:var(--s3);justify-content:space-between}
+@media (max-width:1000px){main{padding:var(--s3)}header{padding:var(--s3)}#providers{grid-template-columns:1fr}.hide-s{display:none}}
 </style>
 </head>
 <body>
 <header>
 <h1>sluice</h1>
-<div class="stat"><b id="s-up">-</b><span>uptime</span></div>
-<div class="stat"><b id="s-req">-</b><span>requests today</span></div>
-<div class="stat"><b id="s-in">-</b><span>tokens in today</span></div>
-<div class="stat"><b id="s-out">-</b><span>tokens out today</span></div>
-<div class="stat"><b id="s-streams">-</b><span>active streams</span></div>
-<div class="stat"><b id="s-paid">-</b><span>paid spend / cap</span></div>
-<div id="conn">connecting...</div>
+<span class="ver" id="h-ver"></span>
+<span class="hstat">up <b id="h-up">-</b></span>
+<span class="hstat hide-s">active requests <b id="h-act">-</b></span>
+<div id="conn"><i></i><span id="conn-t">connecting</span></div>
 </header>
 <main>
+<div id="tiles"></div>
+<h2>Pools <span class="faint">routes in failover order</span></h2>
+<div id="pools"></div>
+<h2>Live routing
+<span class="right">
+<span id="fbtns"></span>
+<input id="fq" type="text" placeholder="filter model / provider" autocomplete="off" spellcheck="false">
+<span class="faint" id="fcount"></span>
+</span></h2>
+<div id="live"><table id="ltable" hidden>
+<thead><tr><th>time</th><th>model</th><th>attempts</th><th class="num">ttft</th><th class="num">in / out</th><th class="num">duration</th><th>status</th></tr></thead>
+<tbody id="lbody"></tbody></table><div class="empty" id="lempty">No requests yet.</div></div>
 <h2>Providers</h2>
 <div id="providers"></div>
-<h2>Live routing</h2>
-<div id="live"></div>
-<h2>Tokens per hour, last 24 h</h2>
-<div id="chartbox"><div id="chart"></div><div id="legend"></div></div>
+<h2>Tokens per hour, last 24 h <span class="faint" id="chartnote"></span></h2>
+<div id="chartbox"><div id="chart"></div><div id="legend"></div><div class="tip" id="tip" hidden></div></div>
 </main>
 <script>
 'use strict';
+var SVGNS = 'http:' + '//www.w3.org/2000/svg';
 var $ = function (id) { return document.getElementById(id); };
 function el(tag, cls, text) {
   var e = document.createElement(tag);
   if (cls) e.className = cls;
   if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+function sv(tag, attrs, parent) {
+  var e = document.createElementNS(SVGNS, tag);
+  for (var k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
   return e;
 }
 function add(parent) {
@@ -118,257 +195,578 @@ function fmtCd(ms) {
   if (s < 3600) return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
   return Math.floor(s / 3600) + 'h ' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm';
 }
-function fmtClock(ms) { return new Date(ms).toTimeString().slice(0, 8); }
+function pad2(n) { return String(n).padStart(2, '0'); }
+function fmtClock(ms) { var d = new Date(ms); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
+function fmtFull(ms) { return new Date(ms).toLocaleString(); }
+function fmtAgo(ms) {
+  var s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 5) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
 function fmtUsd(v) { return '$' + (Number(v) || 0).toFixed(2); }
+function stateLabel(s) { return String(s).replace('_', ' '); }
 
 var S = null;            // last /status snapshot, merged with counters events
 var statusAt = 0;        // performance.now() when S.uptime_secs was current
 var recent = [];         // request records, newest first
 var byId = {};
-var expanded = {};
-var colors = ['#4c9be8', '#3fb56b', '#e0a52e', '#b172e0', '#e5534b', '#2fbfbf', '#e07fb0', '#9aa84a'];
+var colors = ['#6ea8fe', '#4dd0c4', '#f28fad', '#d6b94f', '#9b8cf0', '#7fc97f', '#e0916a', '#8fb4c9'];
+var colorOf = {};
+var lastEventAt = 0;
+var connected = false;
 
-// ---- countdowns: spans carry an absolute performance.now() deadline ----
-function cd(until) {
-  var s = el('span', 'cd');
-  s.dataset.until = String(until);
-  s.textContent = fmtCd(until - performance.now());
-  return s;
+// ---- tickers: spans carry absolute deadlines / timestamps ----
+function cdSpan() { var s = el('span', 'cd'); s.hidden = true; return s; }
+function setCd(s, until) {
+  if (typeof until === 'number') { s.dataset.until = String(until); s.hidden = false; s.textContent = fmtCd(until - performance.now()); }
+  else s.hidden = true;
 }
-function tickCountdowns() {
-  var now = performance.now();
-  var list = document.querySelectorAll('.cd');
-  for (var i = 0; i < list.length; i++) {
-    list[i].textContent = fmtCd(Number(list[i].dataset.until) - now);
-  }
-  if (S) $('s-up').textContent = fmtDur(S.uptime_secs + (now - statusAt) / 1000);
+function agoSpan(ms) { var s = el('span', 'ago'); s.dataset.ts = String(ms); s.textContent = fmtAgo(ms); return s; }
+function tickSlow() {
+  var now = performance.now(), i, list = document.querySelectorAll('.cd');
+  for (i = 0; i < list.length; i++) if (!list[i].hidden) list[i].textContent = fmtCd(Number(list[i].dataset.until) - now);
+  list = document.querySelectorAll('.ago');
+  for (i = 0; i < list.length; i++) list[i].textContent = fmtAgo(Number(list[i].dataset.ts));
+  if (S) $('h-up').textContent = fmtDur(S.uptime_secs + (now - statusAt) / 1000);
+  if (connected && Date.now() - lastEventAt > 7000) setConn(false);   // counters arrive every 2 s
 }
-function stamp(p, t) {
-  p._until = typeof p.expires_in_ms === 'number' ? t + p.expires_in_ms : null;
+function tickFast() {
+  var list = document.querySelectorAll('.el'), now = Date.now();
+  for (var i = 0; i < list.length; i++) list[i].textContent = fmtMs(Math.max(0, now - Number(list[i].dataset.start)));
 }
+function stamp(p, t) { p._until = typeof p.expires_in_ms === 'number' ? t + p.expires_in_ms : null; }
 function stampAll(p, t) {
   stamp(p, t);
   (p.cooldowns || []).forEach(function (c) { stamp(c, t); });
   (p.models || []).forEach(function (m) { stamp(m, t); });
 }
 
-// ---- rendering ----
-function bar(label, used, limit) {
-  var b = el('div', 'bar');
-  var l = el('div', 'lbl');
-  add(l, el('span', null, label));
-  if (limit) {
-    add(l, el('span', null, fmtN(used) + ' / ' + fmtN(limit)));
-    var t = el('div', 'track');
-    var f = el('div', 'fill' + (used >= limit ? ' bad' : used >= limit * 0.8 ? ' warn' : ''));
-    f.style.width = Math.min(100, used / limit * 100) + '%';
-    add(t, f);
-    return add(b, l, t);
-  }
-  add(l, el('span', null, fmtN(used) + ' (no limit set)'));
-  return add(b, l);
-}
-function stateEl(state, until) {
-  var p = el('span', 'pill ' + state, state.replace('_', ' '));
-  if ((state === 'cooling' || state === 'breaker_open') && typeof until === 'number') {
-    p.appendChild(document.createTextNode(' '));
-    p.appendChild(cd(until));
-  }
+// ---- pills ----
+function mkPill() {
+  var p = el('span', 'pill');
+  p.lab = document.createTextNode('');
+  p.cd = cdSpan();
+  add(p, p.lab, p.cd);
   return p;
 }
-function lastErr(e) {
-  return e.reason + (e.model ? ' (' + e.model + ')' : '') + ' at ' + fmtClock(e.time_ms);
+function setPill(p, state, until) {
+  p.className = 'pill st-' + state;
+  p.lab.nodeValue = stateLabel(state);
+  setCd(p.cd, state === 'cooling' || state === 'breaker_open' ? until : null);
 }
-function card(p) {
-  var c = el('div', 'card');
-  var top = el('div', 'top');
-  add(top, el('span', 'name', p.id));
-  if (p.paid) add(top, el('span', 'tag paid', 'paid'));
-  if (p.trains_on_input) add(top, el('span', 'tag', 'trains on input'));
-  var kd = (p.disabled_keys || []).length;
-  add(top, el('span', 'tag', p.keys + (p.keys === 1 ? ' key' : ' keys') + (kd ? ', ' + kd + ' disabled' : '')));
-  add(top, stateEl(p.state, p._until));
-  c.appendChild(top);
-  var lim = p.limits || {};
-  c.appendChild(bar('requests this minute', p.requests_minute, lim.rpm));
-  c.appendChild(bar('requests today', p.requests_day, lim.rpd));
-  if (lim.tpm) c.appendChild(bar('tokens this minute', p.tokens_minute, lim.tpm));
-  if (lim.tpd) c.appendChild(bar('tokens today', p.tokens_day, lim.tpd));
-  var kv = el('div', 'kv');
-  var t = p.ttft_ms || {};
-  [['tokens in', fmtN(p.tokens_in_today)], ['tokens out', fmtN(p.tokens_out_today)],
-   ['ttft median', fmtMs(t.median)], ['ttft p95', fmtMs(t.p95)], ['limit scope', lim.scope || '-']
-  ].forEach(function (x) {
-    var s = el('span', null, x[0] + ' ');
-    add(s, el('b', null, x[1]));
-    kv.appendChild(s);
+function lastErrText(e) { return e.reason + (e.model ? ' (' + e.model + ')' : ''); }
+
+// ---- summary ----
+var tiles = {};
+function mkTiles() {
+  var box = $('tiles');
+  [['req', 'requests today'], ['in', 'tokens in today'], ['out', 'tokens out today'], ['streams', 'active streams'],
+   ['succ', 'success, last 200'], ['fo', 'failovers, last 200'], ['paid', 'paid spend / cap']].forEach(function (t) {
+    var d = el('div', 'tile'), v = el('div', 'v', '-'), sub = el('div', 'sub');
+    add(d, el('div', 'l', t[1]), v, sub);
+    box.appendChild(d);
+    tiles[t[0]] = { d: d, v: v, sub: sub };
   });
-  c.appendChild(kv);
-  if ((p.disabled_keys || []).length) c.appendChild(el('div', 'note', 'disabled keys: ' + p.disabled_keys.join(', ')));
-  if ((p.missing_models || []).length) c.appendChild(el('div', 'note', 'missing models: ' + p.missing_models.join(', ')));
-  (p.cooldowns || []).forEach(function (k) {
-    var d = el('div', 'note', k.scope + ' cooldown' + (k.model ? ' ' + k.model : '') + (k.key ? ' ' + k.key : '') + ' ');
-    if (typeof k._until === 'number') d.appendChild(cd(k._until));
-    c.appendChild(d);
-  });
-  if (p.last_error) c.appendChild(el('div', 'err', 'last error: ' + lastErr(p.last_error)));
-  var btns = el('div', 'btns');
-  var pause = el('button', null, p.state === 'paused' ? 'Resume' : 'Pause');
-  pause.onclick = function () {
-    admin('/admin/provider/' + encodeURIComponent(p.id) + (p.state === 'paused' ? '/resume' : '/pause'));
-  };
-  var clear = el('button', null, 'Clear cooldown');
-  clear.onclick = function () { admin('/admin/cooldowns/clear?provider=' + encodeURIComponent(p.id)); };
-  var n = (p.models || []).length;
-  var tog = el('button', null, (expanded[p.id] ? 'Hide' : 'Show') + ' models (' + n + ')');
-  tog.onclick = function () { expanded[p.id] = !expanded[p.id]; renderProviders(); };
-  add(btns, pause, clear, tog);
-  c.appendChild(btns);
-  if (expanded[p.id] && n) {
-    var tb = el('table', 'models');
-    var hr = el('tr');
-    ['model', 'state', 'req today', 'in', 'out', 'last error'].forEach(function (h, i) {
-      hr.appendChild(el('th', i > 1 && i < 5 ? 'num' : null, h));
-    });
-    tb.appendChild(hr);
-    p.models.forEach(function (m) {
-      var r = el('tr');
-      var st = el('td');
-      st.appendChild(stateEl(m.state, m._until));
-      add(r, el('td', null, m.model), st, el('td', 'num', fmtN(m.requests_today)),
-        el('td', 'num', fmtN(m.tokens_in_today)), el('td', 'num', fmtN(m.tokens_out_today)),
-        el('td', 'dim', m.last_error ? lastErr(m.last_error) : ''));
-      tb.appendChild(r);
-    });
-    c.appendChild(tb);
-  }
-  return c;
 }
-function renderProviders() {
-  var box = $('providers');
-  box.textContent = '';
-  if (!S) return;
-  S.providers.forEach(function (p) { box.appendChild(card(p)); });
+function setTile(k, v, sub, cls) {
+  var t = tiles[k];
+  t.v.textContent = v;
+  t.sub.textContent = sub || '';
+  t.d.className = 'tile' + (cls ? ' ' + cls : '');
 }
 function renderSummary() {
   if (!S) return;
-  $('s-req').textContent = fmtN(S.requests_today);
-  $('s-in').textContent = fmtN(S.tokens_in_today);
-  $('s-out').textContent = fmtN(S.tokens_out_today);
-  $('s-streams').textContent = String(S.active_streams);
+  var done = recent.filter(function (r) { return !r.in_flight && r.status !== 499; });
+  var okc = done.filter(function (r) { return r.status >= 200 && r.status < 400; }).length;
+  var fo = recent.filter(function (r) { return r.attempts.length > 1; }).length;
   var pd = S.paid || {};
-  $('s-paid').textContent = fmtUsd(pd.spend_usd) + ' / ' + fmtUsd(pd.cap_usd);
-  $('s-up').textContent = fmtDur(S.uptime_secs + (performance.now() - statusAt) / 1000);
+  var pct = done.length ? okc / done.length * 100 : null;
+  setTile('req', fmtN(S.requests_today), S.active_requests + ' in flight');
+  setTile('in', fmtN(S.tokens_in_today));
+  setTile('out', fmtN(S.tokens_out_today));
+  setTile('streams', S.active_streams);
+  setTile('succ', pct === null ? '-' : pct.toFixed(pct === 100 ? 0 : 1) + '%', okc + ' of ' + done.length,
+    pct === null ? '' : pct >= 95 ? 'ok' : pct >= 80 ? 'warn' : 'bad');
+  setTile('fo', fo, recent.length ? Math.round(fo / recent.length * 100) + '% of requests' : '');
+  var cap = Number(pd.cap_usd) || 0, sp = Number(pd.spend_usd) || 0;
+  setTile('paid', fmtUsd(sp) + ' / ' + fmtUsd(cap), cap ? Math.round(sp / cap * 100) + '% of cap' : 'paid routes off',
+    cap && sp >= cap ? 'bad' : cap && sp >= cap * 0.8 ? 'warn' : '');
+  $('h-act').textContent = String(S.active_requests);
+  $('h-up').textContent = fmtDur(S.uptime_secs + (performance.now() - statusAt) / 1000);
+  if (S.version) $('h-ver').textContent = 'v' + S.version;
 }
-function chip(cls, text) { return el('span', 'chip ' + cls, text); }
-function renderLive() {
-  var box = $('live');
-  box.textContent = '';
-  var inflight = recent.filter(function (r) { return r.in_flight; });
-  var done = recent.filter(function (r) { return !r.in_flight; }).slice(0, 50);
-  var rows = inflight.concat(done);
-  if (!rows.length) {
-    var none = el('div', 'dim', 'No requests yet.');
-    none.style.padding = '10px';
-    box.appendChild(none);
-    return;
-  }
-  var tb = el('table');
-  var hr = el('tr');
-  ['time', 'model', 'route attempts', 'ttft', 'tokens in/out', 'duration', 'status'].forEach(function (h, i) {
-    hr.appendChild(el('th', i > 2 && i < 6 ? 'num' : null, h));
-  });
-  tb.appendChild(hr);
-  rows.forEach(function (r) {
-    var tr = el('tr', r.in_flight ? 'inflight' : '');
-    var m = el('td');
-    if (r.in_flight) m.appendChild(el('span', 'dot'));
-    m.appendChild(document.createTextNode(r.model));
-    var chain = el('td');
-    r.attempts.forEach(function (a) {
-      var ok = a.outcome === 'ok';
-      chain.appendChild(chip(ok ? 'ok' : 'fail',
-        a.provider + '/' + a.model + (ok ? '' : ' ' + a.outcome) + ' ' + fmtMs(a.ms)));
+
+// ---- pools ----
+var poolKey = '', poolRefs = [];
+function findProv(id) {
+  if (!S) return null;
+  for (var i = 0; i < S.providers.length; i++) if (S.providers[i].id === id) return S.providers[i];
+  return null;
+}
+function routeState(spec) {
+  var i = spec.indexOf('/'), pid = spec.slice(0, i), model = spec.slice(i + 1), p = findProv(pid);
+  if (!p) return { s: 'missing', note: 'unknown provider' };
+  if (p.state === 'paused') return { s: 'paused', note: 'provider paused' };
+  if (p.state === 'key_disabled') return { s: 'key_disabled', note: 'all keys disabled' };
+  if (p.state === 'breaker_open') return { s: 'breaker_open', until: p._until, note: 'breaker open' };
+  var m = (p.models || []).filter(function (x) { return x.model === model; })[0];
+  if ((p.missing_models || []).indexOf(model) >= 0 || (m && m.state === 'missing')) return { s: 'missing', note: 'model not offered' };
+  if (m && m.state === 'cooling') return { s: 'cooling', until: m._until, note: 'route cooling' };
+  if (p.state === 'cooling') return { s: 'cooling', until: p._until, note: 'provider cooling' };
+  return { s: 'ok', note: p.paid ? 'paid route' : '' };
+}
+function renderPools() {
+  if (!S) return;
+  var pools = S.pools || [], key = JSON.stringify(pools);
+  var box = $('pools');
+  if (key !== poolKey) {
+    poolKey = key;
+    box.textContent = '';
+    poolRefs = pools.map(function (pl) {
+      var d = el('div', 'pool'), h = el('div', 'ph'), nx = el('span', 'pnext');
+      add(h, el('span', 'pn', pl.name), el('span', 'tag', pl.routes.length + (pl.routes.length === 1 ? ' route' : ' routes')), nx);
+      d.appendChild(h);
+      var rows = pl.routes.map(function (spec, i) {
+        var r = el('div', 'route'), nm = el('span', 'rn', spec), pill = mkPill(), tg = el('span', 'tag next', 'next');
+        nm.title = spec;
+        add(r, el('span', 'ix', i + 1), nm, tg, pill);
+        d.appendChild(r);
+        return { r: r, tg: tg, pill: pill, spec: spec };
+      });
+      box.appendChild(d);
+      return { nx: nx, rows: rows };
     });
-    if (r.in_flight) chain.appendChild(chip('pending', 'trying...'));
-    else if (!r.attempts.length) chain.appendChild(el('span', 'dim', r.error || '-'));
-    var status = r.in_flight ? 'in flight' : String(r.status === null || r.status === undefined ? '-' : r.status);
-    if (!r.in_flight && r.error) status += ' ' + r.error;
-    add(tr, el('td', null, fmtClock(r.time_ms)), m, chain,
-      el('td', 'num', fmtMs(r.ttft_ms)),
-      el('td', 'num', r.in_flight ? '-' : fmtN(r.tokens_in) + ' / ' + fmtN(r.tokens_out)),
-      el('td', 'num', fmtMs(r.duration_ms)), el('td', null, status));
-    tb.appendChild(tr);
+    if (!pools.length) box.appendChild(el('div', 'dim', 'No pools configured.'));
+  }
+  poolRefs.forEach(function (pr) {
+    var first = -1;
+    pr.rows.forEach(function (row, i) {
+      var st = routeState(row.spec);
+      if (st.s === 'ok' && first < 0) first = i;
+      setPill(row.pill, st.s, st.until);
+      row.r.title = st.note || '';
+      row.r.classList.toggle('off', st.s !== 'ok');
+    });
+    pr.rows.forEach(function (row, i) {
+      row.r.classList.toggle('next', i === first);
+      row.tg.hidden = i !== first;
+    });
+    pr.nx.textContent = first >= 0 ? 'next: ' + pr.rows[first].spec : 'no route available';
+    pr.nx.style.color = first >= 0 ? '' : 'var(--bad)';
   });
-  box.appendChild(tb);
+}
+
+// ---- provider cards (built once, updated in place) ----
+var cards = {};
+var BARS = [['rpm', 'requests_minute', 'req / min'], ['rpd', 'requests_day', 'req / day'],
+            ['tpm', 'tokens_minute', 'tokens / min'], ['tpd', 'tokens_day', 'tokens / day']];
+function mkBar(label) {
+  var b = el('div', 'bar'), l = el('div', 'lbl'), t = el('div', 'track'), f = el('div', 'fill');
+  b.val = el('b');
+  add(l, el('span', null, label), b.val);
+  b.fill = f;
+  add(t, f);
+  return add(b, l, t);
+}
+function setBar(b, used, limit) {
+  used = Number(used) || 0;
+  if (limit) {
+    b.classList.remove('nolim');
+    b.val.textContent = fmtN(used) + ' / ' + fmtN(limit);
+    b.fill.className = 'fill' + (used >= limit ? ' bad' : used >= limit * 0.8 ? ' warn' : '');
+    b.fill.style.width = Math.min(100, used / limit * 100) + '%';
+  } else {
+    b.classList.add('nolim');
+    b.val.textContent = fmtN(used) + ' - no limit set';
+  }
+}
+function statBlock(label) {
+  var s = el('div', 's'), v = el('div', 'v', '-');
+  add(s, el('div', 'l', label), v);
+  s.v = v;
+  return s;
+}
+function feedback(c, text, cls) {
+  c.fb.textContent = text;
+  c.fb.className = 'fb ' + (cls || '');
+  clearTimeout(c.fbTimer);
+  c.fbTimer = setTimeout(function () { c.fb.textContent = ''; }, 3500);
+}
+function admin(c, btn, path, label, done) {
+  btn.disabled = true;
+  btn.textContent = '...';
+  fetch(path, { method: 'POST' }).then(function (r) {
+    return r.json().then(function (j) { return { ok: r.ok, j: j }; });
+  }).then(function (x) {
+    btn.disabled = false;
+    btn.textContent = label(x.j);
+    if (x.ok) feedback(c, done(x.j), 'ok');
+    else feedback(c, 'failed: ' + ((x.j && x.j.error && x.j.error.message) || 'error'), 'bad');
+    fetchStatus(0);
+  }).catch(function () {
+    btn.disabled = false;
+    btn.textContent = label({});
+    feedback(c, 'request failed', 'bad');
+  });
+}
+function mkCard(p) {
+  var c = { id: p.id, open: false };
+  var d = el('div', 'card');
+  var head = el('div', 'head');
+  var sw = el('span', 'sw');
+  sw.style.background = colorOf[p.id] || colors[0];
+  c.tags = el('span');
+  c.tags.style.display = 'contents';
+  c.pill = mkPill();
+  add(head, sw, el('span', 'name', p.id), c.tags, c.pill);
+  var bars = el('div', 'bars');
+  c.bars = BARS.map(function (b) { var x = mkBar(b[2]); bars.appendChild(x); return x; });
+  var stats = el('div', 'stats');
+  c.sIn = statBlock('tokens in'); c.sOut = statBlock('tokens out');
+  c.sMed = statBlock('ttft median'); c.sP95 = statBlock('ttft p95');
+  c.spark = sv('svg', { 'class': 'spark', viewBox: '0 0 120 30', preserveAspectRatio: 'none' });
+  c.sparkTitle = sv('title', {}, c.spark);
+  c.sparkArea = sv('polygon', { fill: colorOf[p.id] || colors[0], 'fill-opacity': '.18' }, c.spark);
+  c.sparkLine = sv('polyline', { fill: 'none', stroke: colorOf[p.id] || colors[0], 'stroke-width': '1.4', 'vector-effect': 'non-scaling-stroke' }, c.spark);
+  add(stats, c.sIn, c.sOut, c.sMed, c.sP95, c.spark);
+  c.notes = el('div', 'notes');
+  c.err = el('div', 'err');
+  c.errText = document.createTextNode('');
+  c.errAgo = agoSpan(0);
+  add(c.err, c.errText, c.errAgo);
+  var btns = el('div', 'btns');
+  c.pause = el('button', null, 'Pause');
+  c.clear = el('button', null, 'Clear cooldown');
+  c.tog = el('button', null, 'Models');
+  c.fb = el('span', 'fb');
+  c.pause.onclick = function () {
+    var pp = findProv(p.id), paused = pp && pp.state === 'paused';
+    admin(c, c.pause, '/admin/provider/' + encodeURIComponent(p.id) + (paused ? '/resume' : '/pause'),
+      function (j) { return j.paused ? 'Resume' : 'Pause'; },
+      function (j) { return j.paused ? 'paused' : 'resumed'; });
+  };
+  c.clear.onclick = function () {
+    admin(c, c.clear, '/admin/cooldowns/clear?provider=' + encodeURIComponent(p.id), function () { return 'Clear cooldown'; },
+      function (j) { return j.cleared ? 'cleared ' + j.cleared + (j.cleared === 1 ? ' cooldown' : ' cooldowns') : 'nothing to clear'; });
+  };
+  c.tog.onclick = function () { c.open = !c.open; updateCard(c, findProv(p.id)); };
+  add(btns, c.pause, c.clear, c.tog, c.fb);
+  c.models = el('table', 'models');
+  c.models.hidden = true;
+  var th = el('thead'), hr = el('tr');
+  ['model', 'state', 'req today', 'in', 'out', 'last error'].forEach(function (h, i) { hr.appendChild(el('th', i > 1 && i < 5 ? 'num' : null, h)); });
+  add(th, hr);
+  c.mbody = el('tbody');
+  add(c.models, th, c.mbody);
+  add(d, head, bars, stats, c.notes, c.err, btns, c.models);
+  c.root = d;
+  return c;
+}
+function note(parent, text, cls, until) {
+  var n = el('div', 'note' + (cls ? ' ' + cls : ''), text + (until !== undefined ? ' ' : ''));
+  if (until !== undefined) { var s = cdSpan(); setCd(s, until); n.appendChild(s); }
+  parent.appendChild(n);
+}
+function updateCard(c, p) {
+  if (!p) return;
+  c.root.className = 'card st-' + p.state;
+  setPill(c.pill, p.state, p._until);
+  var kd = (p.disabled_keys || []).length;
+  c.tags.textContent = '';
+  if (p.paid) c.tags.appendChild(el('span', 'tag paid', 'paid'));
+  if (p.trains_on_input) c.tags.appendChild(el('span', 'tag', 'trains on input'));
+  c.tags.appendChild(el('span', 'tag', p.keys + (p.keys === 1 ? ' key' : ' keys') + (kd ? ', ' + kd + ' off' : '')));
+  var lim = p.limits || {};
+  BARS.forEach(function (b, i) { setBar(c.bars[i], p[b[1]], lim[b[0]]); });
+  var t = p.ttft_ms || {};
+  c.sIn.v.textContent = fmtN(p.tokens_in_today);
+  c.sOut.v.textContent = fmtN(p.tokens_out_today);
+  c.sMed.v.textContent = fmtMs(t.median);
+  c.sP95.v.textContent = fmtMs(t.p95);
+  c.notes.textContent = '';
+  if (kd) note(c.notes, 'disabled keys: ' + p.disabled_keys.join(', '), '');
+  if ((p.missing_models || []).length) note(c.notes, 'missing models: ' + p.missing_models.join(', '), 'p');
+  (p.cooldowns || []).forEach(function (k) {
+    note(c.notes, k.scope + ' cooldown' + (k.model ? ' ' + k.model : '') + (k.key ? ' ' + k.key : ''), '', k._until);
+  });
+  if (p.last_error) {
+    c.err.hidden = false;
+    c.errText.nodeValue = 'last error: ' + lastErrText(p.last_error) + ' - ';
+    c.errAgo.dataset.ts = String(p.last_error.time_ms);
+    c.errAgo.textContent = fmtAgo(p.last_error.time_ms);
+    c.err.title = fmtFull(p.last_error.time_ms);
+  } else c.err.hidden = true;
+  if (!c.pause.disabled) c.pause.textContent = p.state === 'paused' ? 'Resume' : 'Pause';
+  var n = (p.models || []).length;
+  c.tog.textContent = (c.open ? 'Hide' : 'Show') + ' models (' + n + ')';
+  c.models.hidden = !(c.open && n);
+  if (c.open) {
+    c.mbody.textContent = '';
+    (p.models || []).forEach(function (m) {
+      var r = el('tr'), st = el('td'), pl = mkPill();
+      setPill(pl, m.state, m._until);
+      st.appendChild(pl);
+      var le = el('td', 'dim');
+      if (m.last_error) { le.appendChild(document.createTextNode(lastErrText(m.last_error) + ' ')); le.appendChild(agoSpan(m.last_error.time_ms)); }
+      add(r, el('td', 'mono', m.model), st, el('td', 'num', fmtN(m.requests_today)),
+        el('td', 'num', fmtN(m.tokens_in_today)), el('td', 'num', fmtN(m.tokens_out_today)), le);
+      c.mbody.appendChild(r);
+    });
+  }
+  var h = p.hourly || [];
+  if (h.length) {
+    var vals = h.map(function (x) { return (x.tokens_in || 0) + (x.tokens_out || 0); });
+    var mx = Math.max.apply(null, vals) || 1, w = 120 / (vals.length - 1 || 1), pts = [];
+    vals.forEach(function (v, i) { pts.push((i * w).toFixed(1) + ',' + (28 - v / mx * 26).toFixed(1)); });
+    c.sparkLine.setAttribute('points', pts.join(' '));
+    c.sparkArea.setAttribute('points', '0,30 ' + pts.join(' ') + ' 120,30');
+    c.sparkTitle.textContent = 'tokens per hour, last 24 h (peak ' + fmtN(mx) + ')';
+  }
+}
+function renderProviders() {
+  if (!S) return;
+  var box = $('providers');
+  S.providers.forEach(function (p, i) {
+    if (!colorOf[p.id]) colorOf[p.id] = colors[i % colors.length];
+    var c = cards[p.id];
+    if (!c) { c = cards[p.id] = mkCard(p); box.appendChild(c.root); }
+    updateCard(c, p);
+  });
+}
+
+// ---- live routing ----
+var filt = { mode: 'all', q: '' }, rowRefs = {}, openRows = {};
+function isErr(r) { return !r.in_flight && (!!r.error || (r.status !== null && r.status !== undefined && r.status >= 400)); }
+function matches(r) {
+  if (filt.mode === 'errors' && !isErr(r)) return false;
+  if (filt.mode === 'failovers' && r.attempts.length < 2) return false;
+  if (!filt.q) return true;
+  var hay = [r.model, r.provider || '', r.upstream_model || ''];
+  r.attempts.forEach(function (a) { hay.push(a.provider, a.model); });
+  return hay.join(' ').toLowerCase().indexOf(filt.q) >= 0;
+}
+function chip(cls, text, title) {
+  var c = el('span', 'chip ' + cls, text);
+  if (title) c.title = title;
+  return c;
+}
+function statusText(r) {
+  if (r.in_flight) return 'in flight';
+  var s = r.status === null || r.status === undefined ? '-' : String(r.status);
+  return r.error ? s + ' ' + r.error : s;
+}
+function statusCls(r) {
+  if (r.in_flight) return 's0';
+  return r.status >= 200 && r.status < 400 ? 's2' : 's4';
+}
+function mkRow(r) {
+  var tr = el('tr', 'row'), dt = el('tr', 'detail');
+  var ref = { id: r.id, tr: tr, dt: dt };
+  ref.t = el('td', 'mono'); ref.m = el('td', 'model'); ref.ch = el('td');
+  ref.tt = el('td', 'num'); ref.tk = el('td', 'num'); ref.du = el('td', 'num'); ref.st = el('td');
+  add(tr, ref.t, ref.m, ref.ch, ref.tt, ref.tk, ref.du, ref.st);
+  var dd = el('td');
+  dd.colSpan = 7;
+  dt.appendChild(dd);
+  ref.dd = dd;
+  dt.hidden = true;
+  tr.onclick = function () {
+    openRows[r.id] = !openRows[r.id];
+    var rec = byId[r.id];
+    if (rec) fillRow(ref, rec);
+  };
+  return ref;
+}
+function kvBlock(label, text) {
+  var d = el('div');
+  add(d, el('div', 'l', label), el('div', 'v', text));
+  return d;
+}
+function fillDetail(ref, r) {
+  var dd = ref.dd;
+  dd.textContent = '';
+  var g = el('div', 'dgrid');
+  add(g, kvBlock('started', fmtFull(r.time_ms)), kvBlock('requested model', r.model),
+    kvBlock('served by', r.provider ? r.provider + '/' + (r.upstream_model || '?') : '-'),
+    kvBlock('mode', r.stream ? 'stream' : 'buffered'), kvBlock('ttft', fmtMs(r.ttft_ms)),
+    kvBlock('tokens in / out', fmtN(r.tokens_in) + ' / ' + fmtN(r.tokens_out)),
+    kvBlock('duration', r.in_flight ? 'running' : fmtMs(r.duration_ms)),
+    kvBlock('status', statusText(r)), kvBlock('request id', r.id));
+  dd.appendChild(g);
+  if (!r.attempts.length) { dd.appendChild(el('div', 'dim', r.in_flight ? 'No attempt finished yet.' : 'No upstream attempts were made.')); return; }
+  var tb = el('table', 'att'), hr = el('tr');
+  ['#', 'provider', 'model', 'key', 'outcome', 'time'].forEach(function (h, i) { hr.appendChild(el('th', i === 5 ? 'num' : null, h)); });
+  tb.appendChild(el('thead')).appendChild(hr);
+  var body = el('tbody');
+  r.attempts.forEach(function (a) {
+    var row = el('tr'), ok = a.outcome === 'ok';
+    add(row, el('td', null, a.n), el('td', null, a.provider), el('td', 'mono', a.model), el('td', 'mono', a.key),
+      el('td', ok ? 's2' : 's4', a.outcome), el('td', 'num', fmtMs(a.ms)));
+    body.appendChild(row);
+  });
+  tb.appendChild(body);
+  dd.appendChild(tb);
+}
+function fillRow(ref, r) {
+  var open = !!openRows[r.id];
+  ref.tr.className = 'row' + (r.in_flight ? ' inflight' : '') + (open ? ' open' : '');
+  ref.t.textContent = fmtClock(r.time_ms);
+  ref.t.title = fmtFull(r.time_ms);
+  ref.m.textContent = '';
+  if (r.in_flight) ref.m.appendChild(el('span', 'dot'));
+  ref.m.appendChild(document.createTextNode(r.model));
+  if (r.stream) ref.m.appendChild(el('span', 'tag', 'stream')).style.marginLeft = '6px';
+  ref.m.title = r.model;
+  ref.ch.textContent = '';
+  r.attempts.forEach(function (a) {
+    var ok = a.outcome === 'ok';
+    ref.ch.appendChild(chip(ok ? 'ok' : 'fail', a.provider + '/' + a.model + (ok ? '' : ' ' + a.outcome),
+      a.provider + '/' + a.model + ' key ' + a.key + ' - ' + a.outcome + ' - ' + fmtMs(a.ms)));
+  });
+  if (r.in_flight) ref.ch.appendChild(chip('pending', 'trying...'));
+  else if (!r.attempts.length) ref.ch.appendChild(el('span', 'dim', r.error || '-'));
+  ref.tt.textContent = fmtMs(r.ttft_ms);
+  ref.tk.textContent = r.in_flight ? '-' : fmtN(r.tokens_in) + ' / ' + fmtN(r.tokens_out);
+  if (r.in_flight) {
+    ref.du.className = 'num el';
+    ref.du.dataset.start = String(r.time_ms);
+    ref.du.textContent = fmtMs(Math.max(0, Date.now() - r.time_ms));
+  } else { ref.du.className = 'num'; ref.du.textContent = fmtMs(r.duration_ms); }
+  ref.st.className = statusCls(r);
+  ref.st.textContent = statusText(r);
+  ref.dt.hidden = !open;
+  if (open) fillDetail(ref, r);
+}
+function renderLive() {
+  var body = $('lbody');
+  var rows = recent.filter(matches).slice(0, 100), keep = {};
+  rows.forEach(function (r) { keep[r.id] = true; });
+  Object.keys(rowRefs).forEach(function (id) {
+    if (!keep[id]) { rowRefs[id].tr.remove(); rowRefs[id].dt.remove(); delete rowRefs[id]; }
+  });
+  rows.forEach(function (r, i) {
+    var ref = rowRefs[r.id] || (rowRefs[r.id] = mkRow(r));
+    fillRow(ref, r);
+    if (body.children[i * 2] !== ref.tr) {
+      body.insertBefore(ref.tr, body.children[i * 2] || null);
+      body.insertBefore(ref.dt, ref.tr.nextSibling);
+    }
+  });
+  $('ltable').hidden = !rows.length;
+  var e = $('lempty');
+  e.hidden = !!rows.length;
+  e.textContent = recent.length ? 'No requests match the filter.' : 'No requests yet.';
+  $('fcount').textContent = recent.length ? 'showing ' + rows.length + ' of ' + recent.length : '';
+  renderSummary();
+}
+function mkFilters() {
+  var box = $('fbtns');
+  [['all', 'All'], ['errors', 'Errors only'], ['failovers', 'Failovers only']].forEach(function (f) {
+    var b = el('button', f[0] === 'all' ? 'on' : null, f[1]);
+    b.onclick = function () {
+      filt.mode = f[0];
+      Array.prototype.forEach.call(box.children, function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      renderLive();
+    };
+    box.appendChild(b);
+    box.appendChild(document.createTextNode(' '));
+  });
+  $('fq').oninput = function () { filt.q = this.value.trim().toLowerCase(); renderLive(); };
+}
+
+// ---- chart ----
+function niceMax(v) {
+  if (v <= 0) return 1;
+  var p = Math.pow(10, Math.floor(Math.log10(v))), f = v / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
+}
+function showTip(ev, hour, parts, box) {
+  var tip = $('tip');
+  tip.textContent = '';
+  var a = new Date(hour * 1000), b = new Date(hour * 1000 + 3600000);
+  tip.appendChild(el('div', 'th', a.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + pad2(a.getHours()) + ':00 - ' + pad2(b.getHours()) + ':00'));
+  var tin = 0, tout = 0;
+  parts.forEach(function (p) {
+    if (!p.i && !p.o) return;
+    tin += p.i; tout += p.o;
+    var r = el('div', 'tr'), l = el('span'), sw = el('i');
+    sw.style.background = p.color;
+    add(l, sw, document.createTextNode(p.id));
+    add(r, l, el('span', null, fmtN(p.i) + ' in / ' + fmtN(p.o) + ' out'));
+    tip.appendChild(r);
+  });
+  if (!tin && !tout) tip.appendChild(el('div', 'dim', 'no traffic'));
+  tip.hidden = false;
+  var br = box.getBoundingClientRect(), x = ev.clientX - br.left + 14, y = ev.clientY - br.top - 10;
+  if (x + tip.offsetWidth > br.width - 4) x = ev.clientX - br.left - tip.offsetWidth - 14;
+  tip.style.left = Math.max(4, x) + 'px';
+  tip.style.top = Math.max(4, y) + 'px';
 }
 function renderChart() {
   var box = $('chart'), lg = $('legend');
   box.textContent = '';
   lg.textContent = '';
   if (!S) return;
-  var W = 960, H = 230, L = 46, B = 22, T = 8;
-  box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '"></svg>';   // static markup, no data
-  var svg = box.firstChild, ns = svg.namespaceURI;
-  function mk(tag, attrs, text, parent) {
-    var e = document.createElementNS(ns, tag);
-    for (var k in attrs) e.setAttribute(k, attrs[k]);
-    if (text) e.textContent = text;
-    (parent || svg).appendChild(e);
-    return e;
-  }
+  var W = 960, H = 220, L = 48, B = 22, T = 8;
+  var svg = sv('svg', { viewBox: '0 0 ' + W + ' ' + H });
+  box.appendChild(svg);
   var hours = null;
   var series = S.providers.map(function (p, i) {
     var h = p.hourly || [];
     if (!hours && h.length) hours = h.map(function (x) { return x.hour; });
-    return {
-      id: p.id, color: colors[i % colors.length],
-      v: h.map(function (x) { return (x.tokens_in || 0) + (x.tokens_out || 0); })
-    };
+    return { id: p.id, color: colorOf[p.id] || colors[i % colors.length],
+      i: h.map(function (x) { return x.tokens_in || 0; }), o: h.map(function (x) { return x.tokens_out || 0; }) };
   });
-  var n = hours ? hours.length : 24;
-  var max = 0;
-  for (var i = 0; i < n; i++) {
+  var n = hours ? hours.length : 24, max = 0, j;
+  for (j = 0; j < n; j++) {
     var t = 0;
-    series.forEach(function (s) { t += s.v[i] || 0; });
+    series.forEach(function (s) { t += (s.i[j] || 0) + (s.o[j] || 0); });
     if (t > max) max = t;
   }
-  var ph = H - T - B, bw = (W - L) / n;
+  var top = niceMax(max), ph = H - T - B, bw = (W - L) / n;
+  $('chartnote').textContent = max ? 'peak ' + fmtN(max) + ' in one hour' : 'no traffic yet';
   for (var g = 0; g <= 4; g++) {
     var y = T + ph - ph * g / 4;
-    mk('line', { x1: L, x2: W, y1: y, y2: y, stroke: '#2a323c', 'stroke-width': 1 });
-    mk('text', { x: L - 6, y: y + 4, 'text-anchor': 'end', fill: '#8a95a3', 'font-size': 11 }, fmtN(max * g / 4));
+    sv('line', { x1: L, x2: W, y1: y, y2: y, stroke: '#242c37', 'stroke-width': 1 }, svg);
+    sv('text', { x: L - 6, y: y + 4, 'text-anchor': 'end', fill: '#8794a4', 'font-size': 11 }, svg).textContent = fmtN(top * g / 4);
   }
-  for (var j = 0; j < n; j++) {
-    var base = T + ph;
+  for (j = 0; j < n; j++) {
+    var base = T + ph, parts = [];
     series.forEach(function (s) {
-      var v = s.v[j] || 0;
-      if (!v || !max) return;
-      var hh = v / max * ph;
+      var vi = s.i[j] || 0, vo = s.o[j] || 0, v = vi + vo;
+      parts.push({ id: s.id, color: s.color, i: vi, o: vo });
+      if (!v) return;
+      var hh = Math.max(1, v / top * ph);
       base -= hh;
-      var r = mk('rect', { x: L + j * bw + 2, y: base, width: Math.max(1, bw - 4), height: hh, fill: s.color });
-      mk('title', {}, s.id + ': ' + fmtN(v) + ' tokens', r);
+      sv('rect', { x: L + j * bw + 2, y: base, width: Math.max(1, bw - 4), height: hh, fill: s.color }, svg);
     });
     if (hours && j % 3 === 0) {
-      mk('text', { x: L + j * bw + bw / 2, y: H - 6, 'text-anchor': 'middle', fill: '#8a95a3', 'font-size': 11 },
-        String(new Date(hours[j] * 1000).getHours()).padStart(2, '0') + ':00');
+      sv('text', { x: L + j * bw + bw / 2, y: H - 6, 'text-anchor': 'middle', fill: '#8794a4', 'font-size': 11 }, svg).textContent = pad2(new Date(hours[j] * 1000).getHours()) + ':00';
     }
+    var hit = sv('rect', { x: L + j * bw, y: T, width: bw, height: ph, fill: 'transparent' }, svg);
+    (function (hr, pp) {
+      hit.addEventListener('mousemove', function (ev) { showTip(ev, hr, pp, $('chartbox')); });
+      hit.addEventListener('mouseleave', function () { $('tip').hidden = true; });
+    })(hours ? hours[j] : 0, parts);
   }
   series.forEach(function (s) {
-    var item = el('span');
-    var sw = el('i');
+    var item = el('span'), sw = el('i');
     sw.style.background = s.color;
     add(item, sw, document.createTextNode(s.id));
     lg.appendChild(item);
   });
 }
+
+// ---- data ----
 var renderTimer = null;
 function renderLater() {
   if (renderTimer) return;
   renderTimer = setTimeout(function () { renderTimer = null; renderLive(); }, 100);
 }
-
-// ---- data ----
 function applyStatus(j) {
   var now = performance.now();
   S = j;
@@ -377,22 +775,18 @@ function applyStatus(j) {
   recent = (j.recent || []).slice();
   byId = {};
   recent.forEach(function (r) { byId[r.id] = r; });
-  renderSummary();
   renderProviders();
+  renderPools();
   renderLive();
   renderChart();
 }
 var fetchTimer = null;
-function fetchStatus() {
+function fetchStatus(delay) {
   if (fetchTimer) return;
   fetchTimer = setTimeout(function () {
     fetchTimer = null;
-    fetch('/status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(applyStatus)
-      .catch(function () {});
-  }, 150);
-}
-function admin(path) {
-  fetch(path, { method: 'POST' }).then(function () { fetchStatus(); }).catch(function () {});
+    fetch('/status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(applyStatus).catch(function () {});
+  }, delay === undefined ? 150 : delay);
 }
 function newRec(d) {
   var r = {
@@ -402,10 +796,11 @@ function newRec(d) {
   };
   byId[r.id] = r;
   recent.unshift(r);
-  if (recent.length > 200) delete byId[recent.pop().id];
+  if (recent.length > 200) { var old = recent.pop(); delete byId[old.id]; delete openRows[old.id]; }
   return r;
 }
 function onEvent(type, d) {
+  lastEventAt = Date.now();
   var r = byId[d.id];
   if (type === 'request_start') {
     if (!r) newRec(d);
@@ -428,24 +823,29 @@ function onEvent(type, d) {
     r.ttft_ms = d.ttft_ms;
     r.duration_ms = d.duration_ms;
     renderLater();
+    fetchStatus(2500);      // refresh per-model rows, limits and the chart
   } else if (type === 'route_state') {
     fetchStatus();
   } else if (type === 'counters' && S) {
-    var now = performance.now();
-    var provs = d.providers || [];
+    var now = performance.now(), provs = d.providers || [];
     delete d.providers;
     for (var k in d) S[k] = d[k];
     statusAt = now;
     provs.forEach(function (np) {
-      S.providers.forEach(function (sp) {
-        if (sp.id !== np.id) return;
-        for (var f in np) sp[f] = np[f];
-        stamp(sp, now);
-      });
+      var sp = findProv(np.id);
+      if (!sp) return;
+      for (var f in np) sp[f] = np[f];
+      stamp(sp, now);
+      if (cards[sp.id]) updateCard(cards[sp.id], sp);
     });
+    renderPools();
     renderSummary();
-    renderProviders();
   }
+}
+function setConn(up, text) {
+  connected = up;
+  $('conn').className = up ? 'up' : 'down';
+  $('conn-t').textContent = text || (up ? 'connected' : 'reconnecting');
 }
 var es = null, backoff = 500;
 function connect() {
@@ -460,21 +860,25 @@ function connect() {
   });
   es.onopen = function () {
     backoff = 500;
-    $('conn').textContent = 'live';
-    fetchStatus();
+    lastEventAt = Date.now();
+    setConn(true);
+    fetchStatus(0);
   };
   es.onerror = function () {
     es.close();
-    $('conn').textContent = 'reconnecting...';
+    setConn(false);
     setTimeout(connect, backoff);
     backoff = Math.min(backoff * 2, 10000);
   };
 }
+mkTiles();
+mkFilters();
 fetch('/status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(applyStatus)
-  .catch(function () { $('conn').textContent = 'status unavailable'; })
+  .catch(function () { setConn(false, 'status unavailable'); })
   .then(connect);
-setInterval(tickCountdowns, 1000);
-setInterval(fetchStatus, 60000);   // keeps the hourly chart and heavy fields fresh
+setInterval(tickSlow, 1000);
+setInterval(tickFast, 250);
+setInterval(function () { fetchStatus(0); }, 30000);
 </script>
 </body>
 </html>

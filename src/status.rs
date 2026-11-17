@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::{Path, State};
-use axum::http::Uri;
+use axum::http::{Uri, header};
+use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,8 +27,12 @@ const COUNTERS_INTERVAL: Duration = Duration::from_secs(2);
 /// SSE comment keep-alive interval.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
+/// The dashboard page, embedded at compile time.
+pub const DASHBOARD_HTML: &str = include_str!("../ui/index.html");
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/events", get(events))
@@ -35,6 +40,13 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/admin/provider/{id}/pause", post(pause))
         .route("/admin/provider/{id}/resume", post(resume))
         .route("/admin/cooldowns/clear", post(clear_cooldowns))
+}
+
+async fn dashboard() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DASHBOARD_HTML,
+    )
 }
 
 /// Returns 200 whenever the process is up.

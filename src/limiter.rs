@@ -1,6 +1,6 @@
 //! Route state: scoped quota counters, cooldowns with exponential backoff,
 //! per-provider circuit breakers, disabled keys, missing routes, pause flags,
-//! request counts, hourly token buckets.
+//! request counts, hourly token buckets and paid spend.
 //!
 //! All methods take `&self` and lock one `std::sync::Mutex` for a short,
 //! non-async critical section. Time is passed in (`now`) so tests never sleep.
@@ -27,6 +27,8 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
 const WINDOW: Duration = Duration::from_secs(60);
 /// Hours of per-provider token history kept for the dashboard.
 pub const HOURLY_BUCKETS: u64 = 24;
+/// Cooldowns at most this long are not worth persisting.
+pub const PERSIST_COOLDOWN_MIN: Duration = Duration::from_secs(60);
 
 /// Backoff after `step` earlier consecutive 429s: 15 s, 30 s, ... capped.
 pub fn backoff(step: u32) -> Duration {
@@ -227,6 +229,13 @@ impl Bucket {
 
 type RouteId = (String, usize, String);
 
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Spend {
+    /// UTC day number (days since the epoch).
+    pub day: u64,
+    pub usd: f64,
+}
+
 #[derive(Debug)]
 pub struct State {
     /// `Instant` and wall clock captured together; see [`State::wall`].
@@ -242,6 +251,7 @@ pub struct State {
     buckets: HashMap<ScopeKey, Bucket>,
     /// Per provider: hour number -> (tokens in, tokens out).
     hourly: HashMap<String, BTreeMap<u64, (u64, u64)>>,
+    spend: Spend,
 }
 
 impl Default for State {
@@ -258,6 +268,7 @@ impl Default for State {
             key_counters: HashMap::new(),
             buckets: HashMap::new(),
             hourly: HashMap::new(),
+            spend: Spend::default(),
         }
     }
 }
@@ -373,6 +384,33 @@ impl RouteView for State {
     }
 }
 
+/// A cooldown, with its deadline as wall-clock Unix seconds, for persistence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CooldownSnap {
+    pub scope: ScopeKey,
+    pub until_unix: u64,
+    pub step: u32,
+}
+
+/// A day counter for one bucket, for persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaySnap {
+    pub scope: ScopeKey,
+    pub day: u64,
+    pub requests: u64,
+    pub tokens: u64,
+}
+
+/// Everything that survives a restart.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Snapshot {
+    pub days: Vec<DaySnap>,
+    /// (provider, hour number, tokens in, tokens out)
+    pub hourly: Vec<(String, u64, u64, u64)>,
+    pub cooldowns: Vec<CooldownSnap>,
+    pub spend: Spend,
+}
+
 #[derive(Debug, Default)]
 pub struct Limiter {
     inner: Mutex<State>,
@@ -448,7 +486,7 @@ impl Limiter {
     }
 
     /// Record tokens used by a finished (or cancelled) request: bucket
-    /// counters, the provider's hourly history.
+    /// counters, the provider's hourly history and, for paid providers, spend.
     /// `hints` (provider-reported remaining allowance) then overwrite the
     /// provider-scope counters where they map cleanly:
     ///
@@ -484,6 +522,21 @@ impl Limiter {
         slot.0 = slot.0.saturating_add(usage.input);
         slot.1 = slot.1.saturating_add(usage.output);
         h.retain(|k, _| *k + HOURLY_BUCKETS > hour);
+        if provider.paid
+            && let Some(price) = provider.prices.get(model)
+        {
+            let usd = (usage.input as f64 * price.in_per_mtok
+                + usage.output as f64 * price.out_per_mtok)
+                / 1_000_000.0;
+            let utc_day = unix / 86_400;
+            if st.spend.day != utc_day {
+                st.spend = Spend {
+                    day: utc_day,
+                    usd: 0.0,
+                };
+            }
+            st.spend.usd += usd;
+        }
         let limits = provider.limits.limits;
         let b = st
             .buckets
@@ -505,6 +558,16 @@ impl Limiter {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Paid spend for the current UTC day, in USD.
+    pub fn spend_today(&self, now: Instant) -> f64 {
+        let st = self.lock();
+        if st.spend.day == st.unix(now) / 86_400 {
+            st.spend.usd
+        } else {
+            0.0
         }
     }
 
@@ -588,6 +651,86 @@ impl Limiter {
             st.paused.insert(provider.to_string());
         } else {
             st.paused.remove(provider);
+        }
+    }
+
+    /// Everything worth persisting. Disabled keys, missing routes, pauses and
+    /// breakers are deliberately not included (they last until restart or
+    /// are short). Cooldowns of 60 s or less are not worth keeping.
+    pub fn snapshot(&self, now: Instant) -> Snapshot {
+        let st = self.lock();
+        let unix = st.unix(now);
+        Snapshot {
+            days: st
+                .buckets
+                .iter()
+                .filter(|(_, b)| b.day_req > 0 || b.day_tok > 0)
+                .map(|(k, b)| DaySnap {
+                    scope: k.clone(),
+                    day: b.day,
+                    requests: b.day_req,
+                    tokens: b.day_tok,
+                })
+                .collect(),
+            hourly: st
+                .hourly
+                .iter()
+                .flat_map(|(p, h)| h.iter().map(|(k, (i, o))| (p.clone(), *k, *i, *o)))
+                .collect(),
+            cooldowns: st
+                .cooldowns
+                .iter()
+                .filter(|(_, c)| c.until > now + PERSIST_COOLDOWN_MIN)
+                .map(|(k, c)| CooldownSnap {
+                    scope: k.clone(),
+                    until_unix: unix + c.until.saturating_duration_since(now).as_secs(),
+                    step: c.step,
+                })
+                .collect(),
+            spend: st.spend,
+        }
+    }
+
+    /// Load a snapshot, discarding anything past its reset or expiry.
+    /// `reset_hour` gives each provider's day boundary; scopes of unknown
+    /// providers are dropped.
+    pub fn restore(&self, snap: Snapshot, reset_hour: &dyn Fn(&str) -> Option<u8>, now: Instant) {
+        let mut st = self.lock();
+        let unix = st.unix(now);
+        for d in snap.days {
+            let Some(hour) = reset_hour(&d.scope.provider) else {
+                continue;
+            };
+            if d.day != day_index(unix, hour) {
+                continue;
+            }
+            let b = st.buckets.entry(d.scope).or_default();
+            b.day = d.day;
+            b.day_req = d.requests;
+            b.day_tok = d.tokens;
+        }
+        let cur_hour = unix / 3600;
+        for (p, hour, i, o) in snap.hourly {
+            if reset_hour(&p).is_none() || hour + HOURLY_BUCKETS <= cur_hour || hour > cur_hour {
+                continue;
+            }
+            st.hourly.entry(p).or_default().insert(hour, (i, o));
+        }
+        for c in snap.cooldowns {
+            if reset_hour(&c.scope.provider).is_none() || c.until_unix <= unix {
+                continue;
+            }
+            let until = now + Duration::from_secs(c.until_unix - unix);
+            st.cooldowns.insert(
+                c.scope,
+                Cooldown {
+                    until,
+                    step: c.step,
+                },
+            );
+        }
+        if snap.spend.day == unix / 86_400 {
+            st.spend = snap.spend;
         }
     }
 }
@@ -871,6 +1014,71 @@ mod tests {
         // Tokens used are now 700, so 301 more does not fit.
         assert_eq!(skip(&l, &c, 0, "m", 301, now).unwrap().name(), "quota_tpm");
         assert!(skip(&l, &c, 0, "m", 300, now).is_none());
+        assert_eq!(l.snapshot(now).days[0].requests, 60);
+    }
+
+    #[test]
+    fn snapshot_round_trip_keeps_day_hourly_long_cooldowns_and_spend() {
+        let c = cfg("[provider.limits]\nrpd = 5");
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let now = Instant::now();
+        l.note_request(p, 0, "m", now);
+        let usage = Usage {
+            input: 7,
+            output: 3,
+        };
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now);
+        let long = Some(Duration::from_secs(300));
+        l.record_rate_limit(ScopeKey::route("p", 0, "m"), long, now);
+        let short = Some(Duration::from_secs(30));
+        l.record_rate_limit(ScopeKey::route("p", 1, "m"), short, now);
+        let snap = l.snapshot(now);
+        assert_eq!(snap.cooldowns.len(), 1, "only cooldowns longer than 60 s");
+
+        let l2 = Limiter::new();
+        let reset = |id: &str| (id == "p").then_some(0u8);
+        l2.restore(snap, &reset, now);
+        assert_eq!(hourly_io(&l2, now), [(7, 3)]);
+        assert_eq!(skip(&l2, &c, 0, "m", 0, now).unwrap().name(), "cooldown");
+        assert!(skip(&l2, &c, 1, "m", 0, now).is_none());
+        assert_eq!(l2.snapshot(now).days[0].requests, 1);
+    }
+
+    #[test]
+    fn restore_discards_stale_and_unknown_entries() {
+        let now = Instant::now();
+        let l = Limiter::new();
+        let unix = l.lock().unix(now);
+        let snap = Snapshot {
+            days: vec![
+                DaySnap {
+                    scope: ScopeKey::provider_wide("p"),
+                    day: day_index(unix, 0) - 1,
+                    requests: 9,
+                    tokens: 9,
+                },
+                DaySnap {
+                    scope: ScopeKey::provider_wide("gone"),
+                    day: day_index(unix, 0),
+                    requests: 9,
+                    tokens: 9,
+                },
+            ],
+            hourly: vec![("p".into(), unix / 3600 - 24, 1, 1)],
+            cooldowns: vec![CooldownSnap {
+                scope: ScopeKey::provider_wide("p"),
+                until_unix: unix - 1,
+                step: 3,
+            }],
+            spend: Spend {
+                day: unix / 86_400 - 1,
+                usd: 5.0,
+            },
+        };
+        l.restore(snap, &|id| (id == "p").then_some(0u8), now);
+        assert_eq!(l.snapshot(now), Snapshot::default());
+        assert_eq!(l.spend_today(now), 0.0);
     }
 
     #[test]

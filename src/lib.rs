@@ -9,6 +9,7 @@ pub mod error;
 pub mod limiter;
 pub mod proxy;
 pub mod select;
+pub mod state;
 pub mod status;
 
 use std::future::Future;

@@ -33,6 +33,8 @@ pub enum Skip {
         limit: QuotaKind,
         until: Option<Instant>,
     },
+    /// The request is private and the provider trains on input.
+    Privacy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,7 @@ impl Skip {
                 QuotaKind::Tpm => "quota_tpm",
                 QuotaKind::Tpd => "quota_tpd",
             },
+            Self::Privacy => "private_excluded",
         }
     }
 
@@ -90,6 +93,8 @@ pub struct Selection<'a> {
 pub struct ReqInfo {
     /// Estimated tokens: prompt characters / 4 plus the output allowance.
     pub estimate: u64,
+    /// Exclude providers that train on input.
+    pub private: bool,
 }
 
 /// Read-only view of the route state the selection depends on.
@@ -119,6 +124,14 @@ pub fn select<'a>(
     for c in candidates {
         let n = c.provider.keys.len();
         if n == 0 {
+            continue;
+        }
+        if req.private && c.provider.trains_on_input {
+            out.skipped.push(Skipped {
+                route: format!("{}/{}", c.provider.id, c.model),
+                key: None,
+                reason: Skip::Privacy,
+            });
             continue;
         }
         let start = view.key_rotation(&c.provider.id) % n;
@@ -314,6 +327,30 @@ routes = ["a/m1", "b/m2"]
         assert_eq!(s.skipped[0].reason.until(), Some(until));
         assert_eq!(s.skipped[1].key, None);
         assert_eq!(s.skipped[1].reason.name(), "missing");
+    }
+
+    #[test]
+    fn private_requests_skip_training_providers_with_a_reason() {
+        let cfg = config();
+        let now = Instant::now();
+        let req = ReqInfo {
+            estimate: 0,
+            private: true,
+        };
+        let s = select(
+            &cands(&cfg),
+            Strategy::Priority,
+            0,
+            &req,
+            &Fake::default(),
+            now,
+        );
+        assert_eq!(ids(&s), ["a0/m1", "a1/m1"]);
+        assert_eq!(s.skipped.len(), 1);
+        assert_eq!(s.skipped[0].route, "b/m2");
+        assert_eq!(s.skipped[0].reason, Skip::Privacy);
+        assert_eq!(s.skipped[0].reason.name(), "private_excluded");
+        assert_eq!(s.skipped[0].reason.until(), None);
     }
 
     #[test]

@@ -117,12 +117,25 @@ fn run(config_path: PathBuf) -> Result<(), String> {
             config.providers.len(),
             config.pools.len()
         );
-        sluice::serve(listener, state.clone(), shutdown_signal())
-            .await
-            .map_err(|e| format!("server error: {e}"))?;
+        sluice::state::load(&state);
+        let saver = tokio::spawn(periodic_save(state.clone()));
+        let served = sluice::serve(listener, state.clone(), shutdown_signal()).await;
+        saver.abort();
+        sluice::state::save_logged(&state);
+        served.map_err(|e| format!("server error: {e}"))?;
         println!("sluice stopped");
         Ok(())
     })
+}
+
+/// Write the state file every 30 s.
+async fn periodic_save(state: std::sync::Arc<AppState>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    tick.tick().await; // the first tick completes immediately
+    loop {
+        tick.tick().await;
+        sluice::state::save_logged(&state);
+    }
 }
 
 /// Resolves on Ctrl+C (and SIGTERM on Unix).

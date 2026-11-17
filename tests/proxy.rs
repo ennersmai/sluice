@@ -273,6 +273,23 @@ routes = ["alpha/vendor/model-a", "beta/fallback-model"]
         .unwrap_or_else(|e| panic!("test config invalid: {e}"))
 }
 
+/// Like `start_router`, also returning the shared state. When `load` is set
+/// the state file is loaded first, like a restart does.
+async fn start_router_state(config: Config, load: bool) -> (SocketAddr, Arc<AppState>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState::new(config).unwrap();
+    if load {
+        sluice::state::load(&state);
+    }
+    tokio::spawn(sluice::serve(
+        listener,
+        state.clone(),
+        std::future::pending(),
+    ));
+    (addr, state)
+}
+
 async fn start_router(config: Config) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -298,6 +315,29 @@ async fn post(router: SocketAddr, body: impl Into<Vec<u8>>) -> reqwest::Response
 
 async fn post_json(router: SocketAddr, body: &Value) -> reqwest::Response {
     post(router, serde_json::to_vec(body).unwrap()).await
+}
+
+async fn post_with(
+    router: SocketAddr,
+    body: &Value,
+    headers: &[(&str, &str)],
+) -> reqwest::Response {
+    let mut req = client()
+        .post(format!("http://{router}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {CLIENT_SECRET}"))
+        .body(serde_json::to_vec(body).unwrap());
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    req.send().await.unwrap()
+}
+
+/// A fresh state file path (TOML-literal-safe) that does not exist yet.
+fn temp_state_file(name: &str) -> String {
+    let path = std::env::temp_dir().join(format!("sluice-it-{}-{name}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path.display().to_string().replace('\\', "/")
 }
 
 fn header<'a>(r: &'a reqwest::Response, name: &str) -> &'a str {
@@ -627,26 +667,6 @@ async fn t19_model_outside_allowlist_is_404_with_suggestions_and_no_upstream_cal
 // ---------------------------------------------------------------------------
 // Other M1 behaviour
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn paid_provider_is_refused_with_403_and_no_upstream_call() {
-    // `money` shares alpha's base URL, so a leak would show up on `alpha`.
-    let alpha = Mock::start(Reply::json(200, "{}")).await;
-    let router = start_router(config(&alpha.base_url(), "http://127.0.0.1:9/v1", "")).await;
-
-    let r = post_json(
-        router,
-        &json!({"model": "money/vendor/model-a-pro", "messages": []}),
-    )
-    .await;
-    assert_eq!(r.status(), 403);
-    let v = error_body(r).await;
-    assert_eq!(v["error"]["code"], "paid_route_disabled");
-    let message = v["error"]["message"].as_str().unwrap();
-    assert!(message.contains("paid routes are disabled"), "{message}");
-    assert!(!v.to_string().contains(PAID_KEY));
-    assert!(alpha.calls().is_empty());
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upstream_error_statuses_pass_through_unchanged() {
@@ -1052,6 +1072,13 @@ async fn t21_404_on_a_pool_route_marks_it_missing_and_the_next_route_serves() {
 
 const DEAD: &str = "http://127.0.0.1:9/v1";
 
+fn usage_reply() -> Reply {
+    Reply::json(
+        200,
+        r#"{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t10_known_rpm_limit_skips_the_route_without_an_upstream_call() {
     let beta = Mock::start(Reply::json(200, "{}")).await;
@@ -1161,4 +1188,137 @@ async fn streaming_usage_is_requested_captured_and_hidden_unless_asked_for() {
             "quota_tpm"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// M4: paid cap, privacy, persistence (T14, T15, T16)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t14_paid_cap_rejects_and_survives_a_restart() {
+    let alpha = Mock::start(Reply::json(
+        200,
+        r#"{"usage":{"prompt_tokens":1000,"completion_tokens":1000}}"#,
+    ))
+    .await;
+    let paid = |m: &'static str| json!({"model": m, "messages": []});
+
+    // Cap 0 (the default) blocks paid routes entirely.
+    let router = start_router(config(&alpha.base_url(), DEAD, "")).await;
+    let r = post_json(router, &paid("money/vendor/model-a-pro")).await;
+    assert_eq!(r.status(), 403);
+    assert_eq!(error_body(r).await["error"]["code"], "paid_disabled");
+    assert!(alpha.calls().is_empty());
+
+    // Cap 0.001 USD; one request costs 1000 * 10/1M + 1000 * 20/1M = 0.03.
+    let file = temp_state_file("t14");
+    let top = format!("paid_daily_cap_usd = 0.001\nstate_file = '{file}'");
+    let cfg = || config_full(&top, &alpha.base_url(), DEAD, "", ALPHA_KEY);
+    let (router, state) = start_router_state(cfg(), false).await;
+    let r = post_json(router, &paid("money/vendor/model-a-pro")).await;
+    assert_eq!(r.status(), 200);
+    let r = post_json(router, &paid("money/vendor/model-a-pro")).await;
+    assert_eq!(r.status(), 403);
+    assert_eq!(error_body(r).await["error"]["code"], "paid_cap_reached");
+    let r = post_json(router, &paid("money/vendor/model-a-noprice")).await;
+    assert_eq!(r.status(), 403);
+    assert_eq!(error_body(r).await["error"]["code"], "paid_price_missing");
+    assert_eq!(
+        alpha.calls().len(),
+        1,
+        "only the first paid call went upstream"
+    );
+
+    sluice::state::save(&state).unwrap();
+    let (router, _) = start_router_state(cfg(), true).await;
+    let r = post_json(router, &paid("money/vendor/model-a-pro")).await;
+    assert_eq!(r.status(), 403, "cap survives the restart");
+    assert_eq!(error_body(r).await["error"]["code"], "paid_cap_reached");
+    assert_eq!(alpha.calls().len(), 1);
+    let _ = std::fs::remove_file(&file);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t15_private_requests_never_reach_training_providers() {
+    let alpha = Mock::start(Reply::json(500, "{}")).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let extra = "trains_on_input = true";
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), extra)).await;
+    let private = [("x-router-private", "1")];
+
+    let r = post_with(
+        router,
+        &json!({"model": "beta/m", "messages": []}),
+        &private,
+    )
+    .await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "private_excluded");
+
+    // In a pool the training provider is left out even when the first fails.
+    let pool = json!({"model": "coder", "messages": []});
+    assert_eq!(post_with(router, &pool, &private).await.status(), 500);
+    assert!(beta.calls().is_empty());
+    assert_eq!(post_with(router, &pool, &[]).await.status(), 200);
+    assert_eq!(beta.calls().len(), 1);
+
+    // private_default = true, with a per-request opt-out.
+    let cfg = config_full(
+        "private_default = true",
+        DEAD,
+        &beta.base_url(),
+        extra,
+        ALPHA_KEY,
+    );
+    let router = start_router(cfg).await;
+    let one = json!({"model": "beta/m", "messages": []});
+    assert_eq!(post_with(router, &one, &[]).await.status(), 503);
+    assert_eq!(
+        post_with(router, &one, &[("x-router-private", "0")])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(beta.calls().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t16_restart_restores_day_counters_hourly_buckets_and_long_cooldowns() {
+    let rate_limited = Reply::Full {
+        status: 429,
+        headers: vec![("content-type", "application/json"), ("retry-after", "120")],
+        body: b"{}".to_vec(),
+    };
+    let alpha = Mock::start(rate_limited).await;
+    let beta = Mock::start(usage_reply()).await;
+    let file = temp_state_file("t16");
+    let top = format!("state_file = '{file}'");
+    let cfg = || {
+        let extra = "[provider.limits]\nrpd = 2";
+        config_full(&top, &alpha.base_url(), &beta.base_url(), extra, ALPHA_KEY)
+    };
+    let coder = json!({"model": "coder", "messages": []});
+
+    let (router, state) = start_router_state(cfg(), false).await;
+    for _ in 0..2 {
+        let r = post_json(router, &coder).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(header(&r, "x-router-provider"), "beta");
+    }
+    assert_eq!(alpha.calls().len(), 1, "alpha cooled after its first 429");
+    sluice::state::save(&state).unwrap();
+
+    let (router, state) = start_router_state(cfg(), true).await;
+    let r = post_json(router, &coder).await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "cooldown", "{v}");
+    assert_eq!(v["error"]["routes"][1]["reason"], "quota_rpd", "{v}");
+    assert_eq!(alpha.calls().len(), 1);
+    assert_eq!(beta.calls().len(), 2);
+    let hourly = state.limiter.hourly("beta", Instant::now());
+    let totals = hourly.iter().fold((0, 0), |a, h| (a.0 + h.1, a.1 + h.2));
+    assert_eq!(totals, (20, 10));
+    let _ = std::fs::remove_file(&file);
 }

@@ -51,6 +51,10 @@ pub const HEADER_PROVIDER: &str = "x-router-provider";
 pub const HEADER_UPSTREAM_MODEL: &str = "x-router-upstream-model";
 pub const HEADER_ATTEMPTS: &str = "x-router-attempts";
 pub const HEADER_OVERHEAD_MS: &str = "x-router-overhead-ms";
+/// Request header: `1` excludes providers that train on input, `0` opts out
+/// of `private_default`.
+pub const HEADER_PRIVATE: &str = "x-router-private";
+
 /// Output allowance assumed for the pre-flight estimate when the request
 /// sets neither `max_tokens` nor `max_completion_tokens`.
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
@@ -199,16 +203,7 @@ async fn forward(
     };
 
     if first.provider.paid {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            "paid_route_disabled",
-            format!(
-                "provider \"{}\" is paid; paid routes are disabled until spend-cap enforcement is implemented",
-                first.provider.id
-            ),
-        )
-        .with_param("model"));
+        check_paid(state, first.provider, first.model)?;
     }
 
     let wants_stream = fields.get("stream").and_then(Value::as_bool) == Some(true);
@@ -226,7 +221,10 @@ async fn forward(
 
     let injection = inject_usage_option(fields, wants_stream);
     let (prompt_estimate, estimate) = estimate_tokens(fields);
-    let req = ReqInfo { estimate };
+    let req = ReqInfo {
+        estimate,
+        private: is_private(client_headers, state.config.private_default),
+    };
 
     // Wait for a route to free up when that happens within `max_wait_secs`.
     // The future is dropped if the client disconnects, which ends the wait.
@@ -883,6 +881,60 @@ fn estimate_tokens(fields: &Map<String, Value>) -> (u64, u64) {
     (prompt, prompt.saturating_add(output))
 }
 
+/// `x-router-private: 1` (or `true`) excludes providers that train on input,
+/// `0` (or `false`) opts out of `private_default`.
+fn is_private(headers: &HeaderMap, default: bool) -> bool {
+    match headers
+        .get(HEADER_PRIVATE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        Some("1") => true,
+        Some("0") => false,
+        Some(v) if v.eq_ignore_ascii_case("true") => true,
+        Some(v) if v.eq_ignore_ascii_case("false") => false,
+        _ => default,
+    }
+}
+
+/// Gate an explicit paid route: spending must be enabled, the model must have
+/// a configured price (never spend at an unknown price) and today's spend must
+/// be under the cap.
+fn check_paid(state: &AppState, provider: &Provider, model: &str) -> Result<(), ApiError> {
+    let deny = |code: &'static str, message: String| {
+        ApiError::new(StatusCode::FORBIDDEN, "permission_error", code, message).with_param("model")
+    };
+    let cap = state.config.paid_daily_cap_usd;
+    if cap <= 0.0 {
+        return Err(deny(
+            "paid_disabled",
+            format!(
+                "provider \"{}\" is paid and paid_daily_cap_usd is 0, which blocks paid routes",
+                provider.id
+            ),
+        ));
+    }
+    if !provider.prices.contains_key(model) {
+        return Err(deny(
+            "paid_price_missing",
+            format!(
+                "provider \"{}\" has no [provider.prices] entry for this model; refusing to spend at an unknown price",
+                provider.id
+            ),
+        ));
+    }
+    let spent = state.limiter.spend_today(Instant::now());
+    if spent >= cap {
+        return Err(deny(
+            "paid_cap_reached",
+            format!(
+                "today's paid spend ${spent:.4} has reached the cap of ${cap:.2} (resets at 00:00 UTC)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 503 listing every skipped route with its reason. `Retry-After` is the
 /// time until the earliest cooldown or breaker expiry, when there is one.
 fn unavailable(skipped: &[Skipped], now: Instant) -> ApiError {
@@ -1230,13 +1282,21 @@ keys_env = \"K\"
     }
 
     #[test]
-    fn estimate_tokens_counts_chars_over_four() {
+    fn estimate_and_private_header() {
         let v: Value = json!({"messages": [{"role": "user", "content": "x".repeat(400)}], "max_completion_tokens": 50});
         let f = v.as_object().cloned().unwrap_or_default();
         let (prompt, est) = estimate_tokens(&f);
         assert_eq!((prompt, est), (101, 151)); // 404 chars / 4, role counted
         let none = Map::new();
         assert_eq!(estimate_tokens(&none), (0, 1024));
+
+        let mut h = HeaderMap::new();
+        assert!(!is_private(&h, false));
+        assert!(is_private(&h, true));
+        h.insert(HEADER_PRIVATE, HeaderValue::from_static("1"));
+        assert!(is_private(&h, false));
+        h.insert(HEADER_PRIVATE, HeaderValue::from_static("0"));
+        assert!(!is_private(&h, true));
     }
 
     #[test]

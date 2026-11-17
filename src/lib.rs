@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod discover;
 pub mod error;
 pub mod events;
 pub mod limiter;

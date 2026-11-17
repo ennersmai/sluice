@@ -1,7 +1,7 @@
 //! `sluice` binary: argument parsing, `.env` and config loading, server
 //! start and graceful shutdown. All logic lives in the library crate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sluice::AppState;
@@ -9,8 +9,10 @@ use sluice::config::{Config, DEFAULT_CONFIG_PATH};
 
 const USAGE: &str = "\
 Usage: sluice [--config <path>]
+       sluice models <provider_id> [--filter <text>] [--config <path>]
 
-Runs the router.
+Runs the router, or lists the model ids a provider offers (to fill
+allowlists).
 
 Options:
   --config <path>  Config file to load (default: router.toml)
@@ -22,14 +24,56 @@ current directory, if present.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Serve { config: PathBuf },
+    Serve {
+        config: PathBuf,
+    },
+    Models {
+        provider: String,
+        filter: Option<String>,
+        config: PathBuf,
+    },
     Help,
     Version,
 }
 
+fn parse_models_args(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut provider: Option<String> = None;
+    let mut filter: Option<String> = None;
+    let mut config: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--filter" => {
+                filter = Some(args.next().ok_or("--filter requires a value")?);
+            }
+            "--config" => {
+                let v = args.next().filter(|v| !v.is_empty());
+                config = Some(PathBuf::from(v.ok_or("--config requires a path")?));
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument '{other}'"));
+            }
+            other => {
+                if provider.replace(other.to_string()).is_some() {
+                    return Err("models takes one provider id".to_string());
+                }
+            }
+        }
+    }
+    Ok(Command::Models {
+        provider: provider.ok_or("models requires a provider id")?,
+        filter,
+        config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
+    })
+}
+
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut config: Option<PathBuf> = None;
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+    if args.peek().map(String::as_str) == Some("models") {
+        args.next();
+        return parse_models_args(args);
+    }
     while let Some(arg) = args.next() {
         let value = match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
@@ -72,6 +116,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Command::Models {
+            provider,
+            filter,
+            config,
+        }) => match list_models(&provider, filter.as_deref(), &config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("sluice: {msg}");
+                ExitCode::FAILURE
+            }
+        },
         Err(msg) => {
             eprintln!("sluice: {msg}\n\n{USAGE}");
             ExitCode::from(2)
@@ -90,6 +145,29 @@ fn load_dotenv() -> Result<(), String> {
         )),
         Err(e) => Err(format!("cannot load .env: {e}")),
     }
+}
+
+fn list_models(provider: &str, filter: Option<&str>, config_path: &Path) -> Result<(), String> {
+    load_dotenv()?;
+    let config =
+        Config::load(config_path).map_err(|e| format!("config {}: {e}", config_path.display()))?;
+    let p = config.provider(provider).ok_or_else(|| {
+        let known: Vec<&str> = config.providers.iter().map(|p| p.id.as_str()).collect();
+        format!(
+            "unknown provider \"{provider}\" (configured: {})",
+            known.join(", ")
+        )
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start async runtime: {e}"))?;
+    let client = sluice::proxy::build_client()?;
+    let ids = runtime.block_on(sluice::discover::list_models(&client, p, filter))?;
+    for id in ids {
+        println!("{id}");
+    }
+    Ok(())
 }
 
 fn run(config_path: PathBuf) -> Result<(), String> {
@@ -199,6 +277,20 @@ mod tests {
         assert_eq!(parse(&["-h"]), Ok(Command::Help));
         assert_eq!(parse(&["--version"]), Ok(Command::Version));
         assert_eq!(parse(&["-V"]), Ok(Command::Version));
+    }
+
+    #[test]
+    fn models_subcommand() {
+        assert_eq!(
+            parse(&["models", "groq", "--filter", "llama", "--config", "x.toml"]),
+            Ok(Command::Models {
+                provider: "groq".into(),
+                filter: Some("llama".into()),
+                config: PathBuf::from("x.toml")
+            })
+        );
+        assert!(parse(&["models"]).is_err());
+        assert!(parse(&["models", "a", "b"]).is_err());
     }
 
     #[test]

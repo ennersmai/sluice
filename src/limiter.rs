@@ -1,17 +1,19 @@
-//! Route state: cooldowns with exponential backoff, per-provider circuit
-//! breakers, disabled keys, missing routes, pause flags and request counts.
+//! Route state: scoped quota counters, cooldowns with exponential backoff,
+//! per-provider circuit breakers, disabled keys, missing routes, pause flags,
+//! request counts, hourly token buckets.
 //!
 //! All methods take `&self` and lock one `std::sync::Mutex` for a short,
 //! non-async critical section. Time is passed in (`now`) so tests never sleep.
-//! M3 adds scoped quota counters here.
+//! Wall-clock time (day boundaries, persistence) is derived from `now` and an
+//! anchor pair captured at construction, so one `Instant` drives everything.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::Candidate;
-use crate::config::Strategy;
-use crate::select::{self, RouteView, Selection, Skip};
+use crate::config::{LimitScope, Limits, Provider, Strategy};
+use crate::select::{self, QuotaKind, ReqInfo, RouteView, Selection, Skip};
 
 /// First 429 backoff when the upstream gives no `Retry-After`.
 pub const BACKOFF_BASE: Duration = Duration::from_secs(15);
@@ -21,6 +23,10 @@ pub const BREAKER_THRESHOLD: u32 = 3;
 pub const BREAKER_OPEN: Duration = Duration::from_secs(60);
 /// Longest honoured `Retry-After`.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
+/// The rolling window length.
+const WINDOW: Duration = Duration::from_secs(60);
+/// Hours of per-provider token history kept for the dashboard.
+pub const HOURLY_BUCKETS: u64 = 24;
 
 /// Backoff after `step` earlier consecutive 429s: 15 s, 30 s, ... capped.
 pub fn backoff(step: u32) -> Duration {
@@ -28,9 +34,7 @@ pub fn backoff(step: u32) -> Duration {
     Duration::from_secs(secs).min(BACKOFF_CAP)
 }
 
-/// Scope a cooldown applies to. `None` fields are wildcards, so M3 can cool
-/// a whole key (`model: None`) or provider (`key: None, model: None`) by
-/// building a wider key; lookups already check all three levels.
+/// Scope a cooldown or counter applies to. `None` fields are wildcards.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScopeKey {
     pub provider: String,
@@ -62,6 +66,52 @@ impl ScopeKey {
     }
 }
 
+/// The bucket a provider's `[provider.limits]` apply to for this route.
+/// Cooldowns from a 429 use the same scope.
+pub fn scope_key(provider: &Provider, key: usize, model: &str) -> ScopeKey {
+    match provider.limits.scope {
+        LimitScope::Provider => ScopeKey::provider_wide(&provider.id),
+        LimitScope::Key => ScopeKey::key_wide(&provider.id, key),
+        LimitScope::KeyModel => ScopeKey::route(&provider.id, key, model),
+    }
+}
+
+/// Tokens used by one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+}
+
+impl Usage {
+    pub fn total(&self) -> u64 {
+        self.input.saturating_add(self.output)
+    }
+}
+
+/// Remaining-allowance hints from `x-ratelimit-remaining-*` response headers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemainingHints {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+}
+
+/// Seconds since the Unix epoch.
+pub fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Index of the quota day containing `unix`, with days starting at
+/// `reset_hour` UTC.
+pub fn day_index(unix: u64, reset_hour: u8) -> u64 {
+    unix.saturating_sub(u64::from(reset_hour) * 3600) / 86_400
+}
+
+/// Unix time at which quota day `day` ends.
+fn day_end(day: u64, reset_hour: u8) -> u64 {
+    (day + 1) * 86_400 + u64::from(reset_hour) * 3600
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Cooldown {
     until: Instant,
@@ -75,10 +125,112 @@ struct Breaker {
     open_until: Option<Instant>,
 }
 
+type Window = VecDeque<(Instant, u64)>;
+
+/// Counters for one scope: rolling 60 s window and the current quota day.
+#[derive(Debug, Default, Clone)]
+struct Bucket {
+    win_req: Window,
+    win_tok: Window,
+    day: u64,
+    day_req: u64,
+    day_tok: u64,
+}
+
+fn window_sum(q: &Window, now: Instant) -> u64 {
+    q.iter()
+        .filter(|(t, _)| now.saturating_duration_since(*t) < WINDOW)
+        .map(|(_, n)| *n)
+        .fold(0, u64::saturating_add)
+}
+
+/// When the window will have shed at least `over` units, oldest first.
+fn window_frees(q: &Window, over: u64, now: Instant) -> Option<Instant> {
+    let mut freed = 0u64;
+    for (t, n) in q {
+        if now.saturating_duration_since(*t) >= WINDOW {
+            continue;
+        }
+        freed = freed.saturating_add(*n);
+        if freed >= over {
+            return Some(*t + WINDOW);
+        }
+    }
+    None
+}
+
+fn push_window(q: &mut Window, now: Instant, n: u64) {
+    while q
+        .front()
+        .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= WINDOW)
+    {
+        q.pop_front();
+    }
+    q.push_back((now, n));
+}
+
+impl Bucket {
+    /// Roll the day counters over when `day` differs from the stored one.
+    fn roll(&mut self, day: u64) {
+        if self.day != day {
+            self.day = day;
+            self.day_req = 0;
+            self.day_tok = 0;
+        }
+    }
+
+    /// First known limit this request (`estimate` tokens) would exceed.
+    /// Token limits never block while their counter is still empty: the
+    /// estimate may be wrong, so a first request is always attempted.
+    fn check(
+        &self,
+        limits: &Limits,
+        estimate: u64,
+        day: u64,
+        day_free: Instant,
+        now: Instant,
+    ) -> Option<Skip> {
+        let quota = |limit, until| Some(Skip::Quota { limit, until });
+        if let Some(l) = limits.rpm {
+            let used = window_sum(&self.win_req, now);
+            if used.saturating_add(1) > l {
+                let until = window_frees(&self.win_req, used.saturating_add(1) - l, now);
+                return quota(QuotaKind::Rpm, until);
+            }
+        }
+        if let Some(l) = limits.tpm {
+            let used = window_sum(&self.win_tok, now);
+            if used > 0 && used.saturating_add(estimate) > l {
+                let until = window_frees(&self.win_tok, used.saturating_add(estimate) - l, now);
+                return quota(QuotaKind::Tpm, until);
+            }
+        }
+        let (day_req, day_tok) = if self.day == day {
+            (self.day_req, self.day_tok)
+        } else {
+            (0, 0)
+        };
+        if let Some(l) = limits.rpd
+            && day_req.saturating_add(1) > l
+        {
+            return quota(QuotaKind::Rpd, Some(day_free));
+        }
+        if let Some(l) = limits.tpd
+            && day_tok > 0
+            && day_tok.saturating_add(estimate) > l
+        {
+            return quota(QuotaKind::Tpd, Some(day_free));
+        }
+        None
+    }
+}
+
 type RouteId = (String, usize, String);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
+    /// `Instant` and wall clock captured together; see [`State::wall`].
+    anchor: (Instant, SystemTime),
     cooldowns: HashMap<ScopeKey, Cooldown>,
     breakers: HashMap<String, Breaker>,
     disabled: HashSet<(String, usize)>,
@@ -87,41 +239,126 @@ pub struct State {
     requests: HashMap<RouteId, u64>,
     pool_counters: HashMap<String, usize>,
     key_counters: HashMap<String, usize>,
+    buckets: HashMap<ScopeKey, Bucket>,
+    /// Per provider: hour number -> (tokens in, tokens out).
+    hourly: HashMap<String, BTreeMap<u64, (u64, u64)>>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            anchor: (Instant::now(), SystemTime::now()),
+            cooldowns: HashMap::new(),
+            breakers: HashMap::new(),
+            disabled: HashSet::new(),
+            missing: HashSet::new(),
+            paused: HashSet::new(),
+            requests: HashMap::new(),
+            pool_counters: HashMap::new(),
+            key_counters: HashMap::new(),
+            buckets: HashMap::new(),
+            hourly: HashMap::new(),
+        }
+    }
+}
+
+impl State {
+    /// Wall-clock time for an `Instant`.
+    fn wall(&self, at: Instant) -> SystemTime {
+        let (a_i, a_s) = self.anchor;
+        if at >= a_i {
+            a_s + (at - a_i)
+        } else {
+            a_s.checked_sub(a_i - at).unwrap_or(UNIX_EPOCH)
+        }
+    }
+
+    fn unix(&self, at: Instant) -> u64 {
+        unix_secs(self.wall(at))
+    }
+
+    /// Buckets a request on this route is counted in: the scope bucket, plus
+    /// the route bucket when the model has its own limits.
+    fn buckets_for(provider: &Provider, key: usize, model: &str) -> Vec<ScopeKey> {
+        let scope = scope_key(provider, key, model);
+        let mut out = vec![scope.clone()];
+        if provider.model_limits.contains_key(model) {
+            let route = ScopeKey::route(&provider.id, key, model);
+            if route != scope {
+                out.push(route);
+            }
+        }
+        out
+    }
+
+    fn quota_skip(
+        &self,
+        provider: &Provider,
+        key: usize,
+        model: &str,
+        estimate: u64,
+        now: Instant,
+    ) -> Option<Skip> {
+        let unix = self.unix(now);
+        let day = day_index(unix, provider.reset_utc_hour);
+        let to_reset = day_end(day, provider.reset_utc_hour).saturating_sub(unix);
+        let day_free = now + Duration::from_secs(to_reset.max(1));
+        let scope = scope_key(provider, key, model);
+        if let Some(s) = self
+            .buckets
+            .get(&scope)
+            .and_then(|b| b.check(&provider.limits.limits, estimate, day, day_free, now))
+        {
+            return Some(s);
+        }
+        let limits = provider.model_limits.get(model)?;
+        self.buckets
+            .get(&ScopeKey::route(&provider.id, key, model))?
+            .check(limits, estimate, day, day_free, now)
+    }
 }
 
 impl RouteView for State {
-    fn skip_reason(&self, provider: &str, key: usize, model: &str, now: Instant) -> Option<Skip> {
-        if self.paused.contains(provider) {
+    fn skip_reason(
+        &self,
+        provider: &Provider,
+        key: usize,
+        model: &str,
+        estimate: u64,
+        now: Instant,
+    ) -> Option<Skip> {
+        let id = provider.id.as_str();
+        if self.paused.contains(id) {
             return Some(Skip::Paused);
         }
-        if self.disabled.contains(&(provider.to_string(), key)) {
+        if self.disabled.contains(&(id.to_string(), key)) {
             return Some(Skip::KeyDisabled);
         }
-        if self
-            .missing
-            .contains(&(provider.to_string(), model.to_string()))
-        {
+        if self.missing.contains(&(id.to_string(), model.to_string())) {
             return Some(Skip::Missing);
         }
         if let Some(until) = self
             .breakers
-            .get(provider)
+            .get(id)
             .and_then(|b| b.open_until)
             .filter(|u| *u > now)
         {
             return Some(Skip::BreakerOpen { until });
         }
-        [
-            ScopeKey::provider_wide(provider),
-            ScopeKey::key_wide(provider, key),
-            ScopeKey::route(provider, key, model),
+        let cooling = [
+            ScopeKey::provider_wide(id),
+            ScopeKey::key_wide(id, key),
+            ScopeKey::route(id, key, model),
         ]
         .iter()
         .filter_map(|k| self.cooldowns.get(k))
         .map(|c| c.until)
         .filter(|u| *u > now)
-        .max()
-        .map(|until| Skip::Cooldown { until })
+        .max();
+        if let Some(until) = cooling {
+            return Some(Skip::Cooldown { until });
+        }
+        self.quota_skip(provider, key, model, estimate, now)
     }
 
     fn request_count(&self, provider: &str, key: usize, model: &str) -> u64 {
@@ -156,6 +393,7 @@ impl Limiter {
         &self,
         candidates: &[Candidate<'a>],
         pool: Option<(&str, Strategy)>,
+        req: &ReqInfo,
         now: Instant,
     ) -> Selection<'a> {
         let mut st = self.lock();
@@ -163,7 +401,7 @@ impl Limiter {
             Some((name, s)) => (s, st.pool_counters.get(name).copied().unwrap_or(0)),
             None => (Strategy::Priority, 0),
         };
-        let selection = select::select(candidates, strategy, counter, &*st, now);
+        let selection = select::select(candidates, strategy, counter, req, &*st, now);
         if let Some((name, _)) = pool {
             let c = st.pool_counters.entry(name.to_string()).or_insert(0);
             *c = c.wrapping_add(1);
@@ -182,45 +420,127 @@ impl Limiter {
     /// Re-check one entry just before attempting it.
     pub fn skip_reason(
         &self,
-        provider: &str,
+        provider: &Provider,
         key: usize,
         model: &str,
+        estimate: u64,
         now: Instant,
     ) -> Option<Skip> {
-        self.lock().skip_reason(provider, key, model, now)
+        self.lock().skip_reason(provider, key, model, estimate, now)
     }
 
-    /// Count a request sent upstream (feeds `least_used`).
-    pub fn note_request(&self, provider: &str, key: usize, model: &str) {
+    /// Count a request sent upstream (feeds `least_used` and the request
+    /// counters of every applicable bucket).
+    pub fn note_request(&self, provider: &Provider, key: usize, model: &str, now: Instant) {
         let mut st = self.lock();
         let c = st
             .requests
-            .entry((provider.to_string(), key, model.to_string()))
+            .entry((provider.id.clone(), key, model.to_string()))
             .or_insert(0);
         *c = c.saturating_add(1);
+        let day = day_index(st.unix(now), provider.reset_utc_hour);
+        for scope in State::buckets_for(provider, key, model) {
+            let b = st.buckets.entry(scope).or_default();
+            b.roll(day);
+            b.day_req = b.day_req.saturating_add(1);
+            push_window(&mut b.win_req, now, 1);
+        }
     }
 
-    /// A 2xx response: reset the route's backoff and the provider's breaker count.
-    pub fn record_success(&self, provider: &str, key: usize, model: &str) {
+    /// Record tokens used by a finished (or cancelled) request: bucket
+    /// counters, the provider's hourly history.
+    /// `hints` (provider-reported remaining allowance) then overwrite the
+    /// provider-scope counters where they map cleanly:
+    ///
+    /// - `x-ratelimit-remaining-tokens` is a per-minute figure for the
+    ///   providers that send it, so it sets the rolling token window when
+    ///   `tpm` is known.
+    /// - `x-ratelimit-remaining-requests` is per minute for some providers and
+    ///   per day for others, so it is applied only when exactly one of `rpm`
+    ///   and `rpd` is configured (that one), and ignored when both or neither
+    ///   are known.
+    pub fn record_usage(
+        &self,
+        provider: &Provider,
+        key: usize,
+        model: &str,
+        usage: Usage,
+        hints: RemainingHints,
+        now: Instant,
+    ) {
         let mut st = self.lock();
-        st.cooldowns.remove(&ScopeKey::route(provider, key, model));
-        if let Some(b) = st.breakers.get_mut(provider) {
+        let unix = st.unix(now);
+        let day = day_index(unix, provider.reset_utc_hour);
+        let total = usage.total();
+        for scope in State::buckets_for(provider, key, model) {
+            let b = st.buckets.entry(scope).or_default();
+            b.roll(day);
+            b.day_tok = b.day_tok.saturating_add(total);
+            push_window(&mut b.win_tok, now, total);
+        }
+        let hour = unix / 3600;
+        let h = st.hourly.entry(provider.id.clone()).or_default();
+        let slot = h.entry(hour).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(usage.input);
+        slot.1 = slot.1.saturating_add(usage.output);
+        h.retain(|k, _| *k + HOURLY_BUCKETS > hour);
+        let limits = provider.limits.limits;
+        let b = st
+            .buckets
+            .entry(scope_key(provider, key, model))
+            .or_default();
+        if let (Some(rem), Some(l)) = (hints.tokens, limits.tpm) {
+            b.win_tok.clear();
+            b.win_tok.push_back((now, l.saturating_sub(rem)));
+        }
+        if let Some(rem) = hints.requests {
+            match (limits.rpm, limits.rpd) {
+                (Some(l), None) => {
+                    b.win_req.clear();
+                    b.win_req.push_back((now, l.saturating_sub(rem)));
+                }
+                (None, Some(l)) => {
+                    b.day = day;
+                    b.day_req = l.saturating_sub(rem);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Tokens in and out per hour for `provider`, oldest first, covering the
+    /// last 24 hours: `(hour number since the epoch, in, out)`.
+    pub fn hourly(&self, provider: &str, now: Instant) -> Vec<(u64, u64, u64)> {
+        let st = self.lock();
+        let hour = st.unix(now) / 3600;
+        st.hourly.get(provider).map_or_else(Vec::new, |h| {
+            h.iter()
+                .filter(|(k, _)| **k + HOURLY_BUCKETS > hour)
+                .map(|(k, (i, o))| (*k, *i, *o))
+                .collect()
+        })
+    }
+
+    /// A 2xx response: reset the backoff at `scope` and the provider's
+    /// breaker count.
+    pub fn record_success(&self, scope: &ScopeKey) {
+        let mut st = self.lock();
+        st.cooldowns.remove(scope);
+        if let Some(b) = st.breakers.get_mut(&scope.provider) {
             b.consecutive = 0;
         }
     }
 
-    /// A 429: cool the route down. Uses `retry_after` when given, else the
-    /// exponential backoff. Returns the cooldown length.
+    /// A 429: cool `scope` (the provider's limit scope) down. Uses
+    /// `retry_after` when given, else the exponential backoff. Returns the
+    /// cooldown length.
     pub fn record_rate_limit(
         &self,
-        provider: &str,
-        key: usize,
-        model: &str,
+        scope: ScopeKey,
         retry_after: Option<Duration>,
         now: Instant,
     ) -> Duration {
         let mut st = self.lock();
-        let scope = ScopeKey::route(provider, key, model);
         let prev = st.cooldowns.get(&scope).map_or(0, |c| c.step);
         let (len, step) = match retry_after {
             Some(d) => (d, prev),
@@ -329,9 +649,34 @@ fn parse_http_date(v: &str) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
-    fn cooling(l: &Limiter, now: Instant) -> Option<Skip> {
-        l.skip_reason("p", 0, "m", now)
+    fn cfg(extra: &str) -> Config {
+        let text = format!(
+            "[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\n{extra}\n"
+        );
+        Config::from_toml_str(&text, &|_| Some("key-aaaa-0001,key-aaaa-0002".to_string()))
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn skip(
+        l: &Limiter,
+        c: &Config,
+        key: usize,
+        model: &str,
+        est: u64,
+        now: Instant,
+    ) -> Option<Skip> {
+        l.skip_reason(&c.providers[0], key, model, est, now)
+    }
+
+    fn rate_limit(l: &Limiter, retry: Option<Duration>, now: Instant) -> u64 {
+        l.record_rate_limit(ScopeKey::route("p", 0, "m"), retry, now)
+            .as_secs()
+    }
+
+    fn hourly_io(l: &Limiter, now: Instant) -> Vec<(u64, u64)> {
+        l.hourly("p", now).iter().map(|h| (h.1, h.2)).collect()
     }
 
     #[test]
@@ -342,41 +687,60 @@ mod tests {
         }
         assert_eq!(backoff(u32::MAX), BACKOFF_CAP);
 
+        let c = cfg("[provider.limits]\nscope = \"key_model\"");
         let l = Limiter::new();
         let now = Instant::now();
-        let lens: Vec<u64> = (0..4)
-            .map(|_| l.record_rate_limit("p", 0, "m", None, now).as_secs())
-            .collect();
+        let lens: Vec<u64> = (0..4).map(|_| rate_limit(&l, None, now)).collect();
         assert_eq!(lens, [15, 30, 60, 120]);
         assert_eq!(
-            cooling(&l, now),
+            skip(&l, &c, 0, "m", 0, now),
             Some(Skip::Cooldown {
                 until: now + Duration::from_secs(120)
             })
         );
         // Still cooling just before expiry, free right after.
-        assert!(cooling(&l, now + Duration::from_secs(119)).is_some());
-        assert!(cooling(&l, now + Duration::from_secs(120)).is_none());
+        assert!(skip(&l, &c, 0, "m", 0, now + Duration::from_secs(119)).is_some());
+        assert!(skip(&l, &c, 0, "m", 0, now + Duration::from_secs(120)).is_none());
 
-        l.record_success("p", 0, "m");
-        assert!(cooling(&l, now).is_none());
-        assert_eq!(l.record_rate_limit("p", 0, "m", None, now).as_secs(), 15);
+        l.record_success(&ScopeKey::route("p", 0, "m"));
+        assert!(skip(&l, &c, 0, "m", 0, now).is_none());
+        assert_eq!(rate_limit(&l, None, now), 15);
+    }
+
+    #[test]
+    fn cooldowns_apply_at_the_providers_limit_scope() {
+        let now = Instant::now();
+        let ra = Some(Duration::from_secs(30));
+        // (scope, other model on key 0 also cooled, key 1 also cooled)
+        for (scope, other_model, other_key) in [
+            ("provider", true, true),
+            ("key", true, false),
+            ("key_model", false, false),
+        ] {
+            let c = cfg(&format!("[provider.limits]\nscope = \"{scope}\""));
+            let l = Limiter::new();
+            l.record_rate_limit(scope_key(&c.providers[0], 0, "m"), ra, now);
+            assert!(skip(&l, &c, 0, "m", 0, now).is_some(), "{scope}");
+            assert_eq!(
+                skip(&l, &c, 0, "other", 0, now).is_some(),
+                other_model,
+                "{scope}"
+            );
+            assert_eq!(skip(&l, &c, 1, "m", 0, now).is_some(), other_key, "{scope}");
+        }
     }
 
     #[test]
     fn retry_after_is_used_verbatim_and_does_not_advance_backoff() {
         let l = Limiter::new();
         let now = Instant::now();
-        let ra = Duration::from_secs(30);
-        assert_eq!(l.record_rate_limit("p", 0, "m", Some(ra), now), ra);
-        assert_eq!(cooling(&l, now), Some(Skip::Cooldown { until: now + ra }));
-        // Other keys and models are untouched at route scope.
-        assert!(l.skip_reason("p", 1, "m", now).is_none());
-        assert!(l.skip_reason("p", 0, "other", now).is_none());
+        assert_eq!(rate_limit(&l, Some(Duration::from_secs(30)), now), 30);
+        assert_eq!(rate_limit(&l, None, now), 15);
     }
 
     #[test]
     fn breaker_opens_after_three_consecutive_failures_for_60s() {
+        let c = cfg("");
         let l = Limiter::new();
         let now = Instant::now();
         assert!(!l.record_server_failure("p", now));
@@ -385,29 +749,128 @@ mod tests {
         let open = Skip::BreakerOpen {
             until: now + BREAKER_OPEN,
         };
-        assert_eq!(cooling(&l, now), Some(open));
-        assert!(cooling(&l, now + BREAKER_OPEN).is_none());
+        assert_eq!(skip(&l, &c, 0, "m", 0, now), Some(open));
+        assert!(skip(&l, &c, 0, "m", 0, now + BREAKER_OPEN).is_none());
         // A success in between resets the count.
         assert!(!l.record_server_failure("q", now));
-        l.record_success("q", 0, "m");
+        l.record_success(&ScopeKey::route("q", 0, "m"));
         assert!(!l.record_server_failure("q", now));
         assert!(!l.record_server_failure("q", now));
     }
 
     #[test]
     fn disabled_missing_and_paused_are_sticky() {
+        let c = cfg("");
         let l = Limiter::new();
         let now = Instant::now();
         assert!(l.disable_key("p", 0));
         assert!(!l.disable_key("p", 0));
-        assert_eq!(cooling(&l, now), Some(Skip::KeyDisabled));
-        assert!(l.skip_reason("p", 1, "m", now).is_none());
+        assert_eq!(skip(&l, &c, 0, "m", 0, now), Some(Skip::KeyDisabled));
+        assert!(skip(&l, &c, 1, "m", 0, now).is_none());
         assert!(l.mark_missing("p", "m"));
-        assert_eq!(l.skip_reason("p", 1, "m", now), Some(Skip::Missing));
+        assert_eq!(skip(&l, &c, 1, "m", 0, now), Some(Skip::Missing));
         l.set_paused("p", true);
-        assert_eq!(l.skip_reason("p", 1, "x", now), Some(Skip::Paused));
+        assert_eq!(skip(&l, &c, 1, "x", 0, now), Some(Skip::Paused));
         l.set_paused("p", false);
-        assert!(l.skip_reason("p", 1, "x", now).is_none());
+        assert!(skip(&l, &c, 1, "x", 0, now).is_none());
+    }
+
+    #[test]
+    fn rpm_window_blocks_until_the_oldest_request_ages_out() {
+        let c = cfg("[provider.limits]\nrpm = 2");
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let t0 = Instant::now();
+        l.note_request(p, 0, "m", t0);
+        l.note_request(p, 1, "m", t0 + Duration::from_secs(10));
+        let now = t0 + Duration::from_secs(20);
+        // provider scope: shared across keys and models.
+        let want = Skip::Quota {
+            limit: QuotaKind::Rpm,
+            until: Some(t0 + WINDOW),
+        };
+        assert_eq!(skip(&l, &c, 0, "other", 0, now), Some(want));
+        assert!(skip(&l, &c, 0, "m", 0, t0 + WINDOW).is_none());
+    }
+
+    #[test]
+    fn tpm_uses_usage_plus_estimate_but_never_blocks_an_empty_window() {
+        let c = cfg("[provider.limits]\ntpm = 1000");
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let now = Instant::now();
+        assert!(skip(&l, &c, 0, "m", 5000, now).is_none(), "empty counter");
+        let usage = Usage {
+            input: 500,
+            output: 100,
+        };
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now);
+        assert!(skip(&l, &c, 0, "m", 400, now).is_none());
+        let s = skip(&l, &c, 0, "m", 401, now);
+        assert_eq!(
+            s,
+            Some(Skip::Quota {
+                limit: QuotaKind::Tpm,
+                until: Some(now + WINDOW)
+            })
+        );
+        assert_eq!(hourly_io(&l, now), [(500, 100)]);
+    }
+
+    #[test]
+    fn key_scope_is_per_key_and_model_limits_apply_in_addition() {
+        let c = cfg(
+            "[provider.limits]\nscope = \"key\"\nrpm = 10\n[provider.model_limits.\"m\"]\nrpm = 1",
+        );
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let now = Instant::now();
+        l.note_request(p, 0, "m", now);
+        assert!(matches!(
+            skip(&l, &c, 0, "m", 0, now),
+            Some(Skip::Quota { .. })
+        ));
+        assert!(skip(&l, &c, 1, "m", 0, now).is_none(), "other key");
+        assert!(skip(&l, &c, 0, "x", 0, now).is_none(), "other model");
+    }
+
+    #[test]
+    fn day_counters_reset_at_the_providers_reset_hour() {
+        let c = cfg("reset_utc_hour = 6\n[provider.limits]\nrpd = 1");
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let t0 = Instant::now();
+        l.note_request(p, 0, "m", t0);
+        let s = skip(&l, &c, 0, "m", 0, t0).unwrap();
+        assert_eq!(s.name(), "quota_rpd");
+        let until = s.until().unwrap();
+        assert!(until > t0 && until <= t0 + Duration::from_secs(86_400));
+        assert!(skip(&l, &c, 0, "m", 0, until).is_none(), "new day");
+        assert_eq!(day_index(6 * 3600, 6), 0);
+        assert_eq!(day_index(6 * 3600 - 1, 6), 0);
+        assert_eq!(day_index(6 * 3600 + 86_400, 6), 1);
+        assert_eq!(day_end(0, 6), 86_400 + 6 * 3600);
+    }
+
+    #[test]
+    fn remaining_headers_overwrite_counters_where_they_map_cleanly() {
+        let c = cfg("[provider.limits]\ntpm = 1000\nrpd = 100");
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let now = Instant::now();
+        l.note_request(p, 0, "m", now);
+        let hints = RemainingHints {
+            requests: Some(40),
+            tokens: Some(300),
+        };
+        let usage = Usage {
+            input: 1,
+            output: 1,
+        };
+        l.record_usage(p, 0, "m", usage, hints, now);
+        // Tokens used are now 700, so 301 more does not fit.
+        assert_eq!(skip(&l, &c, 0, "m", 301, now).unwrap().name(), "quota_tpm");
+        assert!(skip(&l, &c, 0, "m", 300, now).is_none());
     }
 
     #[test]

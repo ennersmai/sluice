@@ -253,7 +253,10 @@ id = "money"
 base_url = "{alpha}"
 keys_env = "PAID_KEYS"
 paid = true
-models = ["vendor/model-a-pro"]
+models = ["vendor/model-a-pro", "vendor/model-a-noprice"]
+[provider.prices."vendor/model-a-pro"]
+in_per_mtok = 10.0
+out_per_mtok = 20.0
 
 [[pool]]
 name = "coder"
@@ -802,7 +805,7 @@ async fn request_bodies_beyond_axum_default_limit_are_accepted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn client_disconnect_drops_the_upstream_stream() {
+async fn t17_client_disconnect_mid_stream_cancels_the_upstream_request() {
     let chunks = (0..200)
         .map(|i| {
             (
@@ -1041,4 +1044,121 @@ async fn t21_404_on_a_pool_route_marks_it_missing_and_the_next_route_serves() {
     .await;
     assert_eq!(r.status(), 404);
     assert_eq!(alpha.calls().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// M3: scoped counters, pre-flight filter, usage capture, waiting (T10, T11, T20)
+// ---------------------------------------------------------------------------
+
+const DEAD: &str = "http://127.0.0.1:9/v1";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t10_known_rpm_limit_skips_the_route_without_an_upstream_call() {
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(DEAD, &beta.base_url(), "[provider.limits]\nrpm = 1")).await;
+    let ask = || async move {
+        post_json(
+            router,
+            &json!({"model": "beta/fallback-model", "messages": []}),
+        )
+        .await
+    };
+
+    assert_eq!(ask().await.status(), 200);
+    let r = ask().await;
+    assert_eq!(r.status(), 503);
+    let retry_after: u64 = header(&r, "retry-after").parse().unwrap();
+    assert!((1..=60).contains(&retry_after), "{retry_after}");
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "quota_rpm");
+    assert_eq!(
+        beta.calls().len(),
+        1,
+        "second request never left the router"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11_waits_for_a_cooling_route_that_frees_within_max_wait() {
+    let rate_limited = Reply::Full {
+        status: 429,
+        headers: vec![("content-type", "application/json"), ("retry-after", "1")],
+        body: b"{}".to_vec(),
+    };
+    let script = Reply::Sequence(vec![rate_limited, Reply::json(200, "{}")]);
+    let alpha = Mock::start(script.clone()).await;
+    let beta = Mock::start(script).await;
+    let cfg = config_full(
+        "max_wait_secs = 5",
+        &alpha.base_url(),
+        &beta.base_url(),
+        "",
+        ALPHA_KEY,
+    );
+    let router = start_router(cfg).await;
+    let ask = || async move { post_json(router, &json!({"model": "coder", "messages": []})).await };
+
+    assert_eq!(ask().await.status(), 429, "both routes fail and cool down");
+    let t = Instant::now();
+    let r = ask().await;
+    assert_eq!(r.status(), 200);
+    let waited = t.elapsed();
+    assert!(waited >= Duration::from_millis(900), "{waited:?}");
+    assert!(waited < Duration::from_secs(4), "{waited:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t20_provider_scope_limit_is_shared_by_two_models() {
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let extra = "[provider.limits]\nscope = \"provider\"\nrpm = 2";
+    let router = start_router(config(DEAD, &beta.base_url(), extra)).await;
+    let ask = |m: &'static str| async move {
+        post_json(router, &json!({"model": m, "messages": []})).await
+    };
+
+    assert_eq!(ask("beta/model-one").await.status(), 200);
+    assert_eq!(ask("beta/model-two").await.status(), 200);
+    let r = ask("beta/model-one").await;
+    assert_eq!(r.status(), 503);
+    assert_eq!(
+        error_body(r).await["error"]["routes"][0]["reason"],
+        "quota_rpm"
+    );
+    assert_eq!(beta.calls().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_usage_is_requested_captured_and_hidden_unless_asked_for() {
+    let sse = |s: &str| (Duration::ZERO, s.as_bytes().to_vec());
+    let chunks = vec![
+        sse("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n"),
+        sse("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"),
+        sse("data: [DONE]\n\n"),
+    ];
+    for client_asks in [false, true] {
+        let beta = Mock::start(Reply::Stream(chunks.clone())).await;
+        let extra = "[provider.limits]\ntpm = 20";
+        let router = start_router(config(DEAD, &beta.base_url(), extra)).await;
+        let mut body = json!({"model": "beta/fallback-model", "stream": true, "messages": []});
+        if client_asks {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        let r = post_json(router, &body).await;
+        assert_eq!(r.status(), 200);
+        let text = r.text().await.unwrap();
+        assert!(text.contains("\"content\":\"hi\""), "{text}");
+        assert_eq!(text.contains("prompt_tokens"), client_asks, "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        let sent = beta.only_call().json();
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+
+        // 15 tokens were used: 15 + the 1024 default allowance exceeds tpm = 20.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r = post_json(router, &body).await;
+        assert_eq!(r.status(), 503);
+        assert_eq!(
+            error_body(r).await["error"]["routes"][0]["reason"],
+            "quota_tpm"
+        );
+    }
 }

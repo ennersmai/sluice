@@ -21,8 +21,26 @@ pub enum Skip {
     Paused,
     KeyDisabled,
     Missing,
-    BreakerOpen { until: Instant },
-    Cooldown { until: Instant },
+    BreakerOpen {
+        until: Instant,
+    },
+    Cooldown {
+        until: Instant,
+    },
+    /// A known limit would be exceeded by this request. `until` is when the
+    /// window or day frees up, when it ever does for this request.
+    Quota {
+        limit: QuotaKind,
+        until: Option<Instant>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaKind {
+    Rpm,
+    Rpd,
+    Tpm,
+    Tpd,
 }
 
 impl Skip {
@@ -33,6 +51,12 @@ impl Skip {
             Self::Missing => "missing",
             Self::BreakerOpen { .. } => "breaker_open",
             Self::Cooldown { .. } => "cooldown",
+            Self::Quota { limit, .. } => match limit {
+                QuotaKind::Rpm => "quota_rpm",
+                QuotaKind::Rpd => "quota_rpd",
+                QuotaKind::Tpm => "quota_tpm",
+                QuotaKind::Tpd => "quota_tpd",
+            },
         }
     }
 
@@ -40,6 +64,7 @@ impl Skip {
     pub fn until(&self) -> Option<Instant> {
         match self {
             Self::BreakerOpen { until } | Self::Cooldown { until } => Some(*until),
+            Self::Quota { until, .. } => *until,
             _ => None,
         }
     }
@@ -60,13 +85,21 @@ pub struct Selection<'a> {
     pub skipped: Vec<Skipped>,
 }
 
+/// What the filter needs to know about the request itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReqInfo {
+    /// Estimated tokens: prompt characters / 4 plus the output allowance.
+    pub estimate: u64,
+}
+
 /// Read-only view of the route state the selection depends on.
 pub trait RouteView {
     fn skip_reason(
         &self,
-        provider: &str,
+        provider: &Provider,
         key_idx: usize,
         model: &str,
+        estimate: u64,
         now: Instant,
     ) -> Option<Skip>;
     fn request_count(&self, provider: &str, key_idx: usize, model: &str) -> u64;
@@ -78,6 +111,7 @@ pub fn select<'a>(
     candidates: &[Candidate<'a>],
     strategy: Strategy,
     pool_counter: usize,
+    req: &ReqInfo,
     view: &impl RouteView,
     now: Instant,
 ) -> Selection<'a> {
@@ -90,7 +124,7 @@ pub fn select<'a>(
         let start = view.key_rotation(&c.provider.id) % n;
         for i in 0..n {
             let key_idx = (start + i) % n;
-            match view.skip_reason(&c.provider.id, key_idx, c.model, now) {
+            match view.skip_reason(c.provider, key_idx, c.model, req.estimate, now) {
                 Some(reason) => out.skipped.push(Skipped {
                     route: format!("{}/{}", c.provider.id, c.model),
                     key: (n > 1)
@@ -137,8 +171,8 @@ mod tests {
     }
 
     impl RouteView for Fake {
-        fn skip_reason(&self, p: &str, k: usize, m: &str, _: Instant) -> Option<Skip> {
-            self.skips.get(&(p.into(), k, m.into())).copied()
+        fn skip_reason(&self, p: &Provider, k: usize, m: &str, _: u64, _: Instant) -> Option<Skip> {
+            self.skips.get(&(p.id.clone(), k, m.into())).copied()
         }
         fn request_count(&self, p: &str, k: usize, m: &str) -> u64 {
             self.counts
@@ -161,6 +195,7 @@ keys_env = "A_KEYS"
 id = "b"
 base_url = "http://b/v1"
 keys_env = "B_KEYS"
+trains_on_input = true
 [[pool]]
 name = "p"
 routes = ["a/m1", "b/m2"]
@@ -198,13 +233,27 @@ routes = ["a/m1", "b/m2"]
     fn priority_keeps_order_and_rotates_keys() {
         let cfg = config();
         let now = Instant::now();
-        let s = select(&cands(&cfg), Strategy::Priority, 0, &Fake::default(), now);
+        let s = select(
+            &cands(&cfg),
+            Strategy::Priority,
+            0,
+            &ReqInfo::default(),
+            &Fake::default(),
+            now,
+        );
         assert_eq!(ids(&s), ["a0/m1", "a1/m1", "b0/m2"]);
         let fake = Fake {
             rotation: 1,
             ..Fake::default()
         };
-        let s = select(&cands(&cfg), Strategy::Priority, 0, &fake, now);
+        let s = select(
+            &cands(&cfg),
+            Strategy::Priority,
+            0,
+            &ReqInfo::default(),
+            &fake,
+            now,
+        );
         assert_eq!(ids(&s), ["a1/m1", "a0/m1", "b0/m2"]);
     }
 
@@ -212,7 +261,14 @@ routes = ["a/m1", "b/m2"]
     fn round_robin_rotates_over_eligible() {
         let cfg = config();
         let now = Instant::now();
-        let s = select(&cands(&cfg), Strategy::RoundRobin, 1, &Fake::default(), now);
+        let s = select(
+            &cands(&cfg),
+            Strategy::RoundRobin,
+            1,
+            &ReqInfo::default(),
+            &Fake::default(),
+            now,
+        );
         assert_eq!(ids(&s), ["a1/m1", "b0/m2", "a0/m1"]);
     }
 
@@ -222,7 +278,14 @@ routes = ["a/m1", "b/m2"]
         let mut fake = Fake::default();
         fake.counts.insert(("a".into(), 0, "m1".into()), 5);
         fake.counts.insert(("b".into(), 0, "m2".into()), 1);
-        let s = select(&cands(&cfg), Strategy::LeastUsed, 0, &fake, Instant::now());
+        let s = select(
+            &cands(&cfg),
+            Strategy::LeastUsed,
+            0,
+            &ReqInfo::default(),
+            &fake,
+            Instant::now(),
+        );
         assert_eq!(ids(&s), ["a1/m1", "b0/m2", "a0/m1"]);
     }
 
@@ -236,7 +299,14 @@ routes = ["a/m1", "b/m2"]
             .insert(("a".into(), 0, "m1".into()), Skip::Cooldown { until });
         fake.skips
             .insert(("b".into(), 0, "m2".into()), Skip::Missing);
-        let s = select(&cands(&cfg), Strategy::Priority, 0, &fake, now);
+        let s = select(
+            &cands(&cfg),
+            Strategy::Priority,
+            0,
+            &ReqInfo::default(),
+            &fake,
+            now,
+        );
         assert_eq!(ids(&s), ["a1/m1"]);
         assert_eq!(s.skipped.len(), 2);
         assert_eq!(s.skipped[0].route, "a/m1");
@@ -244,5 +314,17 @@ routes = ["a/m1", "b/m2"]
         assert_eq!(s.skipped[0].reason.until(), Some(until));
         assert_eq!(s.skipped[1].key, None);
         assert_eq!(s.skipped[1].reason.name(), "missing");
+    }
+
+    #[test]
+    fn quota_skip_carries_expiry_only_when_the_window_frees() {
+        let now = Instant::now();
+        let q = |until| Skip::Quota {
+            limit: QuotaKind::Rpm,
+            until,
+        };
+        assert_eq!(q(Some(now)).until(), Some(now));
+        assert_eq!(q(None).until(), None);
+        assert_eq!(q(None).name(), "quota_rpm");
     }
 }

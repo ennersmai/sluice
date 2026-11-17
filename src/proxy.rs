@@ -4,10 +4,14 @@
 //! Retry loop (PRD section 6): each eligible `(provider, key, model)` entry
 //! is tried in order, up to `max_attempts`, while no byte has gone to the
 //! client. A failure after streaming started cannot fail over: the stream
-//! ends with an SSE `error` event. Paid routes are refused outright until
-//! spend cap enforcement exists.
+//! ends with an SSE `error` event. Before planning, explicit paid routes are
+//! checked against the daily spend cap, and when no route is eligible but one
+//! frees up within `max_wait_secs` the request waits and re-plans. Token usage
+//! is captured from the response (see [`Tap`]) and settled once the response
+//! ends or is cancelled.
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -18,16 +22,17 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use futures_util::StreamExt;
-use futures_util::future::ready;
+use futures_util::{Stream, StreamExt};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
 use crate::AppState;
 use crate::catalog::{self, ResolveError, RouteKind};
 use crate::config::{ApiKey, Provider, Strategy};
 use crate::error::ApiError;
-use crate::limiter;
-use crate::select::{Entry, Skipped};
+use crate::limiter::{self, RemainingHints, Usage};
+use crate::select::{Entry, ReqInfo, Skipped};
 
 /// Request body limit for `/v1/chat/completions`. axum's 2 MB default is far
 /// too small for agent requests that carry large contexts.
@@ -46,6 +51,16 @@ pub const HEADER_PROVIDER: &str = "x-router-provider";
 pub const HEADER_UPSTREAM_MODEL: &str = "x-router-upstream-model";
 pub const HEADER_ATTEMPTS: &str = "x-router-attempts";
 pub const HEADER_OVERHEAD_MS: &str = "x-router-overhead-ms";
+/// Output allowance assumed for the pre-flight estimate when the request
+/// sets neither `max_tokens` nor `max_completion_tokens`.
+const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
+
+/// Longest partial SSE line held while scanning for usage.
+const MAX_CARRY_BYTES: usize = 1024 * 1024;
+
+/// Minimum pause before re-planning after a wait, so a bad expiry can never
+/// turn the wait loop into a busy loop.
+const MIN_WAIT: Duration = Duration::from_millis(10);
 
 /// Response headers never copied from the upstream: hop-by-hop headers
 /// (RFC 9110 section 7.6.1), framing headers the server sets itself, and
@@ -209,12 +224,30 @@ async fn forward(
     };
     let is_pool = pool.is_some();
 
-    let plan = state
-        .limiter
-        .plan(&resolution.candidates, pool, Instant::now());
-    if plan.eligible.is_empty() {
-        return Err(unavailable(&plan.skipped, Instant::now()));
-    }
+    let injection = inject_usage_option(fields, wants_stream);
+    let (prompt_estimate, estimate) = estimate_tokens(fields);
+    let req = ReqInfo { estimate };
+
+    // Wait for a route to free up when that happens within `max_wait_secs`.
+    // The future is dropped if the client disconnects, which ends the wait.
+    let max_wait = Duration::from_secs(state.config.max_wait_secs);
+    let mut wait_deadline: Option<Instant> = None;
+    let plan = loop {
+        let now = Instant::now();
+        let plan = state.limiter.plan(&resolution.candidates, pool, &req, now);
+        if !plan.eligible.is_empty() {
+            break plan;
+        }
+        let deadline = *wait_deadline.get_or_insert(now + max_wait);
+        let earliest = plan.skipped.iter().filter_map(|s| s.reason.until()).min();
+        match earliest {
+            Some(at) if !max_wait.is_zero() && at <= deadline => {
+                let wake = at.max(now + MIN_WAIT);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+            }
+            _ => return Err(unavailable(&plan.skipped, now)),
+        }
+    };
 
     let max_attempts = state.config.max_attempts.max(1);
     let first_byte_timeout = Duration::from_secs(state.config.first_byte_timeout_secs);
@@ -234,7 +267,13 @@ async fn forward(
         // State may have changed since planning (breaker, disabled key).
         if state
             .limiter
-            .skip_reason(&provider.id, entry.key_idx, entry.model, Instant::now())
+            .skip_reason(
+                provider,
+                entry.key_idx,
+                entry.model,
+                req.estimate,
+                Instant::now(),
+            )
             .is_some()
         {
             continue;
@@ -247,7 +286,7 @@ async fn forward(
         let url = upstream_url(&provider.base_url);
         state
             .limiter
-            .note_request(&provider.id, entry.key_idx, entry.model);
+            .note_request(provider, entry.key_idx, entry.model, Instant::now());
         let overhead = *first_overhead.get_or_insert_with(|| started.elapsed());
 
         let send = state
@@ -285,6 +324,7 @@ async fn forward(
             continue;
         }
 
+        let hints = remaining_hints(upstream.headers());
         let mut headers = forwarded_response_headers(upstream.headers());
         add_router_headers(&mut headers, &provider.id, entry.model, attempts, overhead);
         let is_event_stream = upstream
@@ -297,20 +337,27 @@ async fn forward(
                     .starts_with("text/event-stream")
             });
 
+        let scope = limiter::scope_key(provider, entry.key_idx, entry.model);
         let body = if wants_stream || is_event_stream {
-            if class == Class::Success {
-                state
-                    .limiter
-                    .record_success(&provider.id, entry.key_idx, entry.model);
-            }
-            Body::from_stream(guarded_stream(state, entry, upstream))
+            let tap = (class == Class::Success).then(|| {
+                state.limiter.record_success(&scope);
+                Tap::new(
+                    Settle::new(state, entry, prompt_estimate, hints),
+                    injection.injected,
+                )
+            });
+            Body::from_stream(guarded_stream(state, entry, upstream, tap))
         } else {
             match upstream.bytes().await {
                 Ok(bytes) => {
                     if class == Class::Success {
-                        state
-                            .limiter
-                            .record_success(&provider.id, entry.key_idx, entry.model);
+                        state.limiter.record_success(&scope);
+                        let mut settle = Settle::new(state, entry, prompt_estimate, hints);
+                        settle.usage = usage_from_body(&bytes);
+                        settle.out_bytes = bytes.len() as u64;
+                        // Records usage as it drops; the body is already
+                        // fully buffered.
+                        drop(settle);
                     }
                     Body::from(bytes)
                 }
@@ -333,7 +380,7 @@ async fn forward(
         // Every entry went unavailable between planning and attempting.
         let replan = state
             .limiter
-            .plan(&resolution.candidates, None, Instant::now());
+            .plan(&resolution.candidates, None, &req, Instant::now());
         return Err(unavailable(&replan.skipped, Instant::now()));
     }
     match last {
@@ -407,10 +454,8 @@ fn apply_failure(
     let now = Instant::now();
     match class {
         Class::RateLimited => {
-            let len =
-                state
-                    .limiter
-                    .record_rate_limit(provider, entry.key_idx, model, retry_after, now);
+            let scope = limiter::scope_key(entry.provider, entry.key_idx, model);
+            let len = state.limiter.record_rate_limit(scope, retry_after, now);
             eprintln!(
                 "warn: cooldown provider={provider} key={key} model={model} for {}s (429)",
                 len.as_secs()
@@ -444,13 +489,14 @@ fn apply_failure(
 /// the client gets one final SSE `error` event and the stream ends (no retry,
 /// the failure counts toward the provider's breaker). Dropping the body, e.g.
 /// because the client went away, drops the upstream response and so cancels
-/// the upstream request.
+/// the upstream request; the [`Tap`] (when present) then settles whatever
+/// usage was seen so far.
 fn guarded_stream(
     state: &Arc<AppState>,
     entry: &Entry<'_>,
     upstream: reqwest::Response,
-) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> + use<> {
-    let state = Arc::clone(state);
+    tap: Option<Tap>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> + use<> {
     let provider = entry.provider.id.clone();
     let error_event = Bytes::from(format!(
         "event: error\ndata: {}\n\n",
@@ -462,28 +508,379 @@ fn guarded_stream(
         )
         .body()
     ));
-    upstream.bytes_stream().scan(false, move |failed, chunk| {
-        if *failed {
-            return ready(None);
+    let seed = StreamState {
+        inner: Box::pin(upstream.bytes_stream()),
+        tap,
+        done: false,
+        state: Arc::clone(state),
+        provider,
+        error_event,
+    };
+    futures_util::stream::unfold(seed, |mut st| async move {
+        if st.done {
+            return None;
         }
-        ready(match chunk {
-            Ok(bytes) => Some(Ok(bytes)),
-            Err(_) => {
-                *failed = true;
-                if state
-                    .limiter
-                    .record_server_failure(&provider, Instant::now())
-                {
-                    eprintln!(
-                        "warn: circuit breaker open provider={provider} for {}s (stream failure)",
-                        limiter::BREAKER_OPEN.as_secs()
-                    );
+        loop {
+            match st.inner.next().await {
+                Some(Ok(bytes)) => match st.tap.as_mut() {
+                    Some(tap) => {
+                        if let Some(out) = tap.push(bytes) {
+                            return Some((Ok(out), st));
+                        }
+                    }
+                    None => return Some((Ok(bytes), st)),
+                },
+                Some(Err(_)) => {
+                    st.done = true;
+                    if st
+                        .state
+                        .limiter
+                        .record_server_failure(&st.provider, Instant::now())
+                    {
+                        eprintln!(
+                            "warn: circuit breaker open provider={} for {}s (stream failure)",
+                            st.provider,
+                            limiter::BREAKER_OPEN.as_secs()
+                        );
+                    }
+                    eprintln!("warn: stream interrupted provider={}", st.provider);
+                    let event = st.error_event.clone();
+                    return Some((Ok(event), st));
                 }
-                eprintln!("warn: stream interrupted provider={provider}");
-                Some(Ok(error_event.clone()))
+                None => {
+                    st.done = true;
+                    let rest = st.tap.as_mut().and_then(Tap::finish);
+                    return rest.map(|b| (Ok(b), st));
+                }
             }
-        })
+        }
     })
+}
+
+struct StreamState {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    tap: Option<Tap>,
+    done: bool,
+    state: Arc<AppState>,
+    provider: String,
+    error_event: Bytes,
+}
+
+/// Usage of one response, recorded in the limiter when dropped, so it is
+/// settled whether the response finished, failed or was cancelled by the
+/// client. Without a `usage` object the estimate is the prompt estimate in
+/// and `bytes forwarded / 4` out.
+struct Settle {
+    state: Arc<AppState>,
+    provider: String,
+    key_idx: usize,
+    model: String,
+    prompt_estimate: u64,
+    hints: RemainingHints,
+    usage: Option<Usage>,
+    out_bytes: u64,
+}
+
+impl Settle {
+    fn new(
+        state: &Arc<AppState>,
+        entry: &Entry<'_>,
+        prompt_estimate: u64,
+        hints: RemainingHints,
+    ) -> Self {
+        Self {
+            state: Arc::clone(state),
+            provider: entry.provider.id.clone(),
+            key_idx: entry.key_idx,
+            model: entry.model.to_string(),
+            prompt_estimate,
+            hints,
+            usage: None,
+            out_bytes: 0,
+        }
+    }
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        let Some(provider) = self.state.config.provider(&self.provider) else {
+            return;
+        };
+        let usage = self.usage.unwrap_or(Usage {
+            input: self.prompt_estimate,
+            output: self.out_bytes / 4,
+        });
+        self.state.limiter.record_usage(
+            provider,
+            self.key_idx,
+            &self.model,
+            usage,
+            self.hints,
+            Instant::now(),
+        );
+    }
+}
+
+/// Scans a streamed response line by line for the `usage` object without
+/// buffering the stream: only a partial trailing line is carried between
+/// chunks. When `filter` is set (the router injected `include_usage` and the
+/// client did not ask for it) the usage-only chunk (`choices: []`) is removed
+/// from what is forwarded, which makes the tap hold back a partial trailing
+/// line until its newline arrives; otherwise chunks pass through untouched
+/// and immediately.
+struct Tap {
+    settle: Settle,
+    carry: Vec<u8>,
+    /// A dropped `data:` line's blank separator line is dropped too.
+    drop_blank: bool,
+    /// The current line outgrew [`MAX_CARRY_BYTES`]: pass its tail unscanned.
+    skip_line: bool,
+    filter: bool,
+}
+
+impl Tap {
+    fn new(settle: Settle, filter: bool) -> Self {
+        Self {
+            settle,
+            carry: Vec::new(),
+            drop_blank: false,
+            skip_line: false,
+            filter,
+        }
+    }
+
+    /// Process one upstream chunk; returns what to forward, if anything.
+    fn push(&mut self, chunk: Bytes) -> Option<Bytes> {
+        self.settle.out_bytes = self.settle.out_bytes.saturating_add(chunk.len() as u64);
+        if !self.filter {
+            self.scan(&chunk, None);
+            return Some(chunk);
+        }
+        let mut out = Vec::with_capacity(chunk.len());
+        self.scan(&chunk, Some(&mut out));
+        (!out.is_empty()).then(|| Bytes::from(out))
+    }
+
+    /// End of stream: handle an unterminated last line.
+    fn finish(&mut self) -> Option<Bytes> {
+        if self.carry.is_empty() {
+            return None;
+        }
+        let line = std::mem::take(&mut self.carry);
+        let keep = self.handle_line(&line);
+        (self.filter && keep).then(|| Bytes::from(line))
+    }
+
+    fn scan(&mut self, chunk: &[u8], mut out: Option<&mut Vec<u8>>) {
+        let mut pos = 0;
+        while let Some(rel) = chunk
+            .get(pos..)
+            .and_then(|rest| rest.iter().position(|b| *b == b'\n'))
+        {
+            let end = pos + rel;
+            let seg = chunk.get(pos..end).unwrap_or_default();
+            pos = end + 1;
+            let owned: Vec<u8>;
+            let line: &[u8] = if self.carry.is_empty() {
+                seg
+            } else {
+                self.carry.extend_from_slice(seg);
+                owned = std::mem::take(&mut self.carry);
+                &owned
+            };
+            let keep = if self.skip_line {
+                self.skip_line = false;
+                true
+            } else {
+                self.handle_line(line)
+            };
+            if keep && let Some(o) = out.as_mut() {
+                o.extend_from_slice(line);
+                o.push(b'\n');
+            }
+        }
+        let rest = chunk.get(pos..).unwrap_or_default();
+        if rest.is_empty() {
+            return;
+        }
+        if self.skip_line {
+            if let Some(o) = out.as_mut() {
+                o.extend_from_slice(rest);
+            }
+        } else if self.carry.len() + rest.len() > MAX_CARRY_BYTES {
+            // Pathologically long line: give up scanning it, pass it on.
+            if let Some(o) = out.as_mut() {
+                o.append(&mut self.carry);
+                o.extend_from_slice(rest);
+            }
+            self.carry.clear();
+            self.skip_line = true;
+        } else {
+            self.carry.extend_from_slice(rest);
+        }
+    }
+
+    /// Inspect one complete line; returns false when it must not be forwarded.
+    fn handle_line(&mut self, line: &[u8]) -> bool {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return !std::mem::take(&mut self.drop_blank);
+        }
+        self.drop_blank = false;
+        let Some(payload) = line.strip_prefix(b"data:") else {
+            return true;
+        };
+        let payload = payload.trim_ascii_start();
+        if payload.first() != Some(&b'{') || !mentions_usage_object(payload) {
+            return true;
+        }
+        let Ok(chunk) = serde_json::from_slice::<StreamChunk>(payload) else {
+            return true;
+        };
+        let Some(usage) = chunk.usage.and_then(UsageFields::into_usage) else {
+            return true;
+        };
+        self.settle.usage = Some(usage);
+        let usage_only = chunk.choices.is_none_or(|c| c.is_empty());
+        if self.filter && usage_only {
+            self.drop_blank = true;
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    usage: Option<UsageFields>,
+    choices: Option<Vec<IgnoredAny>>,
+}
+
+#[derive(Deserialize)]
+struct BodyUsage {
+    usage: Option<UsageFields>,
+}
+
+#[derive(Deserialize)]
+struct UsageFields {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+impl UsageFields {
+    fn into_usage(self) -> Option<Usage> {
+        if self.prompt_tokens.is_none() && self.completion_tokens.is_none() {
+            // Only a total: count it all as output so it is not lost.
+            return self.total_tokens.map(|t| Usage {
+                input: 0,
+                output: t,
+            });
+        }
+        Some(Usage {
+            input: self.prompt_tokens.unwrap_or(0),
+            output: self.completion_tokens.unwrap_or(0),
+        })
+    }
+}
+
+/// The `usage` object of a buffered (non-streaming) response body.
+fn usage_from_body(body: &[u8]) -> Option<Usage> {
+    serde_json::from_slice::<BodyUsage>(body)
+        .ok()?
+        .usage?
+        .into_usage()
+}
+
+/// Cheap pre-check before JSON parsing a chunk: does it contain
+/// `"usage"` followed by `:` and an object (not `null`)?
+fn mentions_usage_object(payload: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"usage\"";
+    let mut from = 0;
+    while let Some(i) = payload
+        .get(from..)
+        .and_then(|p| p.windows(KEY.len()).position(|w| w == KEY))
+    {
+        let after = from + i + KEY.len();
+        let rest = payload.get(after..).unwrap_or_default().trim_ascii_start();
+        if let Some(rest) = rest.strip_prefix(b":")
+            && rest.trim_ascii_start().first() == Some(&b'{')
+        {
+            return true;
+        }
+        from = after;
+    }
+    false
+}
+
+/// `x-ratelimit-remaining-requests` / `-tokens` as whole numbers; anything
+/// else (durations, floats, junk) is ignored.
+fn remaining_hints(headers: &HeaderMap) -> RemainingHints {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    RemainingHints {
+        requests: get("x-ratelimit-remaining-requests"),
+        tokens: get("x-ratelimit-remaining-tokens"),
+    }
+}
+
+/// Ask the upstream for a usage chunk on streaming requests. Returns whether
+/// the router added `include_usage` (so the client did not ask for it and the
+/// usage-only chunk must be hidden from it). A `stream_options` that is not
+/// an object is left alone.
+fn inject_usage_option(fields: &mut Map<String, Value>, wants_stream: bool) -> Injection {
+    if !wants_stream {
+        return Injection { injected: false };
+    }
+    let injected = match fields.get_mut("stream_options") {
+        None | Some(Value::Null) => {
+            fields.insert("stream_options".to_string(), json!({"include_usage": true}));
+            true
+        }
+        Some(Value::Object(o)) => {
+            let asked = o.get("include_usage") == Some(&Value::Bool(true));
+            if !asked {
+                o.insert("include_usage".to_string(), Value::Bool(true));
+            }
+            !asked
+        }
+        Some(_) => false,
+    };
+    Injection { injected }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Injection {
+    injected: bool,
+}
+
+/// `(prompt tokens, pre-flight estimate)`: characters in `messages` and
+/// `tools` divided by 4, and that plus `max_tokens` /
+/// `max_completion_tokens` (1024 when neither is set).
+fn estimate_tokens(fields: &Map<String, Value>) -> (u64, u64) {
+    fn chars(v: &Value) -> u64 {
+        match v {
+            Value::String(s) => s.chars().count() as u64,
+            Value::Array(a) => a.iter().map(chars).sum(),
+            Value::Object(o) => o.values().map(chars).sum(),
+            _ => 0,
+        }
+    }
+    let prompt: u64 = ["messages", "tools"]
+        .iter()
+        .filter_map(|k| fields.get(*k))
+        .map(chars)
+        .sum::<u64>()
+        / 4;
+    let output = ["max_tokens", "max_completion_tokens"]
+        .iter()
+        .find_map(|k| fields.get(*k).and_then(Value::as_u64))
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    (prompt, prompt.saturating_add(output))
 }
 
 /// 503 listing every skipped route with its reason. `Retry-After` is the
@@ -736,5 +1133,130 @@ mod tests {
         assert!(e.message.ends_with("did you mean: coder"));
         assert_eq!(e.body()["error"]["suggestions"][0], "coder");
         assert_eq!(e.body()["error"]["param"], "model");
+    }
+
+    fn tap(filter: bool) -> Tap {
+        let text = "[[provider]]
+id = \"p\"
+base_url = \"http://p/v1\"
+keys_env = \"K\"
+";
+        let config = crate::config::Config::from_toml_str(text, &|_| Some("k".into())).unwrap();
+        let state = AppState::new(config).unwrap();
+        let provider = state.config.provider("p").unwrap();
+        let entry = Entry {
+            provider,
+            key_idx: 0,
+            model: "m",
+        };
+        let settle = Settle::new(&state, &entry, 0, RemainingHints::default());
+        Tap::new(settle, filter)
+    }
+
+    const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}
+
+";
+    const USAGE: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}
+
+";
+    const DONE: &str = "data: [DONE]
+
+";
+
+    /// Feed `stream` split at `cut` and return (forwarded bytes, usage).
+    fn run(stream: &str, cut: usize, filter: bool) -> (Vec<u8>, Option<Usage>) {
+        let mut t = tap(filter);
+        let (a, b) = stream.as_bytes().split_at(cut);
+        let mut out = Vec::new();
+        for part in [a, b] {
+            if let Some(o) = t.push(Bytes::copy_from_slice(part)) {
+                out.extend_from_slice(&o);
+            }
+        }
+        if let Some(o) = t.finish() {
+            out.extend_from_slice(&o);
+        }
+        (out, t.settle.usage)
+    }
+
+    #[test]
+    fn tap_captures_usage_across_any_chunk_split_and_forwards_verbatim_when_asked() {
+        let stream = format!("{CONTENT}{USAGE}{DONE}");
+        let want = Usage {
+            input: 11,
+            output: 5,
+        };
+        for cut in 0..=stream.len() {
+            let (out, usage) = run(&stream, cut, false);
+            assert_eq!(out, stream.as_bytes(), "cut {cut}");
+            assert_eq!(usage, Some(want), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn tap_hides_the_usage_only_chunk_from_clients_that_did_not_ask() {
+        let stream = format!("{CONTENT}{USAGE}{DONE}");
+        let expected = format!("{CONTENT}{DONE}");
+        for cut in 0..=stream.len() {
+            let (out, usage) = run(&stream, cut, true);
+            assert_eq!(String::from_utf8_lossy(&out), expected, "cut {cut}");
+            assert_eq!(usage.map(|u| u.total()), Some(16), "cut {cut}");
+        }
+        // CRLF framing and a usage object inside a chunk that has choices.
+        let with_choices = "data: {\"choices\":[{}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\r\n\r\n";
+        let (out, usage) = run(with_choices, 7, true);
+        assert_eq!(out, with_choices.as_bytes());
+        assert_eq!(usage.map(|u| u.total()), Some(3));
+        let crlf = USAGE.replace('\n', "\r\n");
+        let (out, _) = run(&crlf, 3, true);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn usage_helpers() {
+        assert!(mentions_usage_object(b"{\"usage\": {\"a\":1}}"));
+        assert!(!mentions_usage_object(b"{\"usage\":null}"));
+        assert!(!mentions_usage_object(b"{\"x\":1}"));
+        let body = br#"{"id":"x","usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
+        assert_eq!(
+            usage_from_body(body),
+            Some(Usage {
+                input: 3,
+                output: 4
+            })
+        );
+        assert_eq!(usage_from_body(b"{}"), None);
+        assert_eq!(usage_from_body(b"nope"), None);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_chars_over_four() {
+        let v: Value = json!({"messages": [{"role": "user", "content": "x".repeat(400)}], "max_completion_tokens": 50});
+        let f = v.as_object().cloned().unwrap_or_default();
+        let (prompt, est) = estimate_tokens(&f);
+        assert_eq!((prompt, est), (101, 151)); // 404 chars / 4, role counted
+        let none = Map::new();
+        assert_eq!(estimate_tokens(&none), (0, 1024));
+    }
+
+    #[test]
+    fn stream_options_injection() {
+        let mut f = Map::new();
+        assert!(inject_usage_option(&mut f, true).injected);
+        assert_eq!(f["stream_options"], json!({"include_usage": true}));
+        let mut f = json!({"stream_options": {"include_usage": true, "x": 1}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        assert!(!inject_usage_option(&mut f, true).injected);
+        let mut f = json!({"stream_options": {"x": 1}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        assert!(inject_usage_option(&mut f, true).injected);
+        assert_eq!(f["stream_options"], json!({"x": 1, "include_usage": true}));
+        let mut f = Map::new();
+        assert!(!inject_usage_option(&mut f, false).injected);
+        assert!(f.is_empty());
     }
 }

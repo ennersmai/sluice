@@ -7,6 +7,7 @@
 
 bind = "127.0.0.1:8787"     # non-loopback addresses require ROUTER_API_KEY
 state_file = "state.json"
+# log_file = "sluice.log"   # also append every request line and warning to this file
 max_attempts = 6
 first_byte_timeout_secs = 20
 max_wait_secs = 15          # hold a request this long if a route frees up soon, 0 disables

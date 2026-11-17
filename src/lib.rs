@@ -9,6 +9,7 @@ pub mod discover;
 pub mod error;
 pub mod events;
 pub mod limiter;
+pub mod logsink;
 pub mod proxy;
 pub mod select;
 pub mod state;

@@ -180,6 +180,9 @@ fn run(config_path: PathBuf) -> Result<(), String> {
         .build()
         .map_err(|e| format!("cannot start async runtime: {e}"))?;
 
+    if let Some(path) = &config.log_file {
+        sluice::logsink::init(path)?;
+    }
     let state = AppState::new(config)?;
 
     runtime.block_on(async move {

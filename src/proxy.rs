@@ -133,6 +133,9 @@ enum Class {
     /// Returned to the client unchanged, no retry, no state change.
     Passthrough,
     RateLimited,
+    /// This request is too big for the route (pool only): fail over with
+    /// no cooldown and no breaker count.
+    TooLarge,
     ServerError,
     KeyRejected,
     Missing,
@@ -142,6 +145,7 @@ fn classify(status: StatusCode, is_pool: bool) -> Class {
     match status.as_u16() {
         200..=299 => Class::Success,
         429 => Class::RateLimited,
+        413 if is_pool => Class::TooLarge,
         500 | 502 | 503 | 504 => Class::ServerError,
         401..=403 => Class::KeyRejected,
         404 if is_pool => Class::Missing,
@@ -259,7 +263,10 @@ async fn forward(
                 let wake = at.max(now + MIN_WAIT);
                 tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
             }
-            _ => return Err(unavailable(&plan.skipped, now)),
+            _ => {
+                note_skipped(&track, &plan.skipped);
+                return Err(unavailable(&plan.skipped, now));
+            }
         }
     };
 
@@ -327,15 +334,46 @@ async fn forward(
         let headers_elapsed = attempt_start.elapsed();
         let status = upstream.status();
         let class = classify(status, is_pool);
+        if is_pool && class == Class::Passthrough && matches!(status.as_u16(), 400 | 422) {
+            // A 400/422 only fails over when it says the request is too big.
+            let mut headers = forwarded_response_headers(upstream.headers());
+            let body = read_capped(upstream).await;
+            if looks_too_large(&body) {
+                track.attempt(provider, entry.model, key, "too_large", attempt_start);
+                last = Some(LastError {
+                    status,
+                    headers,
+                    body,
+                    provider: provider.id.clone(),
+                    model: entry.model.to_string(),
+                });
+                continue;
+            }
+            add_router_headers(&mut headers, &provider.id, entry.model, attempts, overhead);
+            let reason = format!("http_{}", status.as_u16());
+            track.attempt(provider, entry.model, key, &reason, attempt_start);
+            track.end(status.as_u16(), None, Usage::default());
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            return Ok(response);
+        }
         if !matches!(class, Class::Success | Class::Passthrough) {
-            let retry_after = upstream
-                .headers()
-                .get(header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| limiter::parse_retry_after(v, SystemTime::now()));
+            let hint = (class == Class::RateLimited)
+                .then(|| header_hint(upstream.headers()))
+                .flatten();
             let headers = forwarded_response_headers(upstream.headers());
             let body = read_capped(upstream).await;
-            let reason = format!("http_{}", status.as_u16());
+            let retry_after = match (class, hint) {
+                (_, Some(d)) => Some(d),
+                (Class::RateLimited, None) => limiter::body_hint(&body).map(limiter::clamp_hint),
+                _ => None,
+            };
+            let reason = if class == Class::TooLarge {
+                "too_large".to_string()
+            } else {
+                format!("http_{}", status.as_u16())
+            };
             track.attempt(provider, entry.model, key, &reason, attempt_start);
             apply_failure(state, entry, class, retry_after, &reason);
             last = Some(LastError {
@@ -434,6 +472,7 @@ async fn forward(
         let replan = state
             .limiter
             .plan(&resolution.candidates, None, &req, Instant::now());
+        note_skipped(&track, &replan.skipped);
         return Err(unavailable(&replan.skipped, Instant::now()));
     }
     match last {
@@ -517,7 +556,7 @@ fn apply_failure(
         Class::RateLimited => {
             let scope = limiter::scope_key(entry.provider, entry.key_idx, model);
             let len = state.limiter.record_rate_limit(scope, retry_after, now);
-            eprintln!(
+            crate::elog!(
                 "warn: cooldown provider={provider} key={key} model={model} for {}s (429)",
                 len.as_secs()
             );
@@ -525,7 +564,7 @@ fn apply_failure(
         }
         Class::ServerError => {
             if state.limiter.record_server_failure(provider, now) {
-                eprintln!(
+                crate::elog!(
                     "warn: circuit breaker open provider={provider} for {}s (last failure: {detail})",
                     limiter::BREAKER_OPEN.as_secs()
                 );
@@ -540,7 +579,7 @@ fn apply_failure(
         }
         Class::KeyRejected => {
             if state.limiter.disable_key(provider, entry.key_idx) {
-                eprintln!(
+                crate::elog!(
                     "error: key disabled until restart provider={provider} key={key} (upstream {detail})"
                 );
                 events.route_state(provider, None, Some(key), "key_disabled", None);
@@ -548,11 +587,13 @@ fn apply_failure(
         }
         Class::Missing => {
             if state.limiter.mark_missing(provider, model) {
-                eprintln!("warn: model missing provider={provider} model={model} (upstream 404)");
+                crate::elog!(
+                    "warn: model missing provider={provider} model={model} (upstream 404)"
+                );
                 events.route_state(provider, Some(model), None, "missing", None);
             }
         }
-        Class::Success | Class::Passthrough => {}
+        Class::Success | Class::Passthrough | Class::TooLarge => {}
     }
 }
 
@@ -621,13 +662,13 @@ fn guarded_stream(
                         .limiter
                         .record_server_failure(&st.provider, Instant::now())
                     {
-                        eprintln!(
+                        crate::elog!(
                             "warn: circuit breaker open provider={} for {}s (stream failure)",
                             st.provider,
                             limiter::BREAKER_OPEN.as_secs()
                         );
                     }
-                    eprintln!("warn: stream interrupted provider={}", st.provider);
+                    crate::elog!("warn: stream interrupted provider={}", st.provider);
                     let event = st.error_event.clone();
                     return Some((Ok(event), st));
                 }
@@ -925,6 +966,42 @@ fn mentions_usage_object(payload: &[u8]) -> bool {
 
 /// `x-ratelimit-remaining-requests` / `-tokens` as whole numbers; anything
 /// else (durations, floats, junk) is ignored.
+/// Cooldown hint from the headers of a 429: `Retry-After`, else the
+/// `x-ratelimit-reset-*` pair.
+fn header_hint(headers: &HeaderMap) -> Option<Duration> {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(d) = text(header::RETRY_AFTER.as_str())
+        .and_then(|v| limiter::parse_retry_after(v, SystemTime::now()))
+    {
+        return Some(d);
+    }
+    let hints = remaining_hints(headers);
+    limiter::reset_hint(
+        text("x-ratelimit-reset-requests"),
+        text("x-ratelimit-reset-tokens"),
+        hints.requests,
+        hints.tokens,
+    )
+    .map(limiter::clamp_hint)
+}
+
+/// Whether a 400/422 error body says the request exceeds a context or size
+/// limit. Looks at the error body only, bounded, case-insensitive.
+fn looks_too_large(body: &[u8]) -> bool {
+    const PHRASES: &[&str] = &[
+        "context_length_exceeded",
+        "maximum context length",
+        "context length",
+        "context_length",
+        "too many tokens",
+        "reduce the length",
+        "request too large",
+    ];
+    let head = body.get(..body.len().min(16 * 1024)).unwrap_or_default();
+    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
+    PHRASES.iter().any(|p| text.contains(p))
+}
+
 fn remaining_hints(headers: &HeaderMap) -> RemainingHints {
     let get = |name: &str| {
         headers
@@ -1049,6 +1126,15 @@ fn check_paid(state: &AppState, provider: &Provider, model: &str) -> Result<(), 
 
 /// 503 listing every skipped route with its reason. `Retry-After` is the
 /// time until the earliest cooldown or breaker expiry, when there is one.
+/// Hand the skipped routes to the request log line.
+fn note_skipped(track: &ReqTrack, skipped: &[Skipped]) {
+    track.skipped(
+        skipped
+            .iter()
+            .map(|s| format!("{}:{}", s.route, s.reason.name())),
+    );
+}
+
 fn unavailable(skipped: &[Skipped], now: Instant) -> ApiError {
     let routes: Vec<Value> = skipped
         .iter()

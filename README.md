@@ -13,7 +13,7 @@ Restart to apply config changes; startup is near instant and counters and long c
 
 ## Config reference (`router.toml`)
 
-Top level: `bind` (default `127.0.0.1:8787`; any non-loopback address requires `ROUTER_API_KEY` in `.env`, checked as a bearer token on every path), `state_file`, `max_attempts`, `first_byte_timeout_secs`, `max_wait_secs` (hold a request this long if a route frees up soon, 0 disables), `private_default`, `paid_daily_cap_usd`.
+Top level: `bind` (default `127.0.0.1:8787`; any non-loopback address requires `ROUTER_API_KEY` in `.env`, checked as a bearer token on every path), `state_file`, `log_file` (optional; also append every request line and warning to this file), `max_attempts`, `first_byte_timeout_secs`, `max_wait_secs` (hold a request this long if a route frees up soon, 0 disables), `private_default`, `paid_daily_cap_usd`.
 
 Each `[[provider]]`:
 

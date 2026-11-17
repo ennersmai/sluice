@@ -31,6 +31,7 @@ use crate::AppState;
 use crate::catalog::{self, ResolveError, RouteKind};
 use crate::config::{ApiKey, Provider, Strategy};
 use crate::error::ApiError;
+use crate::events::ReqTrack;
 use crate::limiter::{self, RemainingHints, Usage};
 use crate::select::{Entry, ReqInfo, Skipped};
 
@@ -110,9 +111,18 @@ async fn chat_completions(
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let started = Instant::now();
-    match forward(&state, &headers, body, started).await {
+    // Shared with the response body (settled when it ends) and dropped with
+    // this future if the client goes away, which ends the request as 499.
+    let mut track: Option<Arc<ReqTrack>> = None;
+    match forward(&state, &headers, body, started, &mut track).await {
         Ok(response) => response,
-        Err(e) => e.into_response(),
+        Err(e) => {
+            match &track {
+                Some(t) => t.end(e.status.as_u16(), Some(e.code), Usage::default()),
+                None => state.events.log_unrouted(e.status.as_u16()),
+            }
+            e.into_response()
+        }
     }
 }
 
@@ -153,6 +163,7 @@ async fn forward(
     client_headers: &HeaderMap,
     body: Result<Bytes, BytesRejection>,
     started: Instant,
+    track_slot: &mut Option<Arc<ReqTrack>>,
 ) -> Result<Response, ApiError> {
     let body = body.map_err(|rejection| {
         let status = rejection.status();
@@ -174,6 +185,12 @@ async fn forward(
     let fields = request.as_object_mut().ok_or_else(|| {
         ApiError::bad_request("invalid_request", "request body must be a JSON object")
     })?;
+
+    let wants_stream = fields.get("stream").and_then(Value::as_bool) == Some(true);
+    let track = Arc::clone(track_slot.insert(state.events.begin(
+        fields.get("model").and_then(Value::as_str).unwrap_or("-"),
+        wants_stream,
+    )));
 
     let requested = match fields.get("model") {
         Some(Value::String(m)) => m.clone(),
@@ -206,7 +223,6 @@ async fn forward(
         check_paid(state, first.provider, first.model)?;
     }
 
-    let wants_stream = fields.get("stream").and_then(Value::as_bool) == Some(true);
     let pool = match resolution.kind {
         RouteKind::Pool(name) => Some((
             name,
@@ -278,6 +294,7 @@ async fn forward(
         }
         attempts += 1;
         last_provider.clone_from(&provider.id);
+        let attempt_start = Instant::now();
 
         let outgoing = encode_request(fields, provider, entry.model)?;
         let upstream_headers = upstream_request_headers(key, &provider.id, client_headers)?;
@@ -295,12 +312,19 @@ async fn forward(
             .send();
         let upstream = match tokio::time::timeout(first_byte_timeout, send).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
+                track.attempt(provider, entry.model, key, "unreachable", attempt_start);
                 apply_failure(state, entry, Class::ServerError, None, "unreachable");
+                continue;
+            }
+            Err(_) => {
+                track.attempt(provider, entry.model, key, "timeout", attempt_start);
+                apply_failure(state, entry, Class::ServerError, None, "timeout");
                 continue;
             }
         };
 
+        let headers_elapsed = attempt_start.elapsed();
         let status = upstream.status();
         let class = classify(status, is_pool);
         if !matches!(class, Class::Success | Class::Passthrough) {
@@ -311,7 +335,9 @@ async fn forward(
                 .and_then(|v| limiter::parse_retry_after(v, SystemTime::now()));
             let headers = forwarded_response_headers(upstream.headers());
             let body = read_capped(upstream).await;
-            apply_failure(state, entry, class, retry_after, status.as_str());
+            let reason = format!("http_{}", status.as_u16());
+            track.attempt(provider, entry.model, key, &reason, attempt_start);
+            apply_failure(state, entry, class, retry_after, &reason);
             last = Some(LastError {
                 status,
                 headers,
@@ -337,34 +363,63 @@ async fn forward(
 
         let scope = limiter::scope_key(provider, entry.key_idx, entry.model);
         let body = if wants_stream || is_event_stream {
-            let tap = (class == Class::Success).then(|| {
+            let tap = if class == Class::Success {
                 state.limiter.record_success(&scope);
-                Tap::new(
-                    Settle::new(state, entry, prompt_estimate, hints),
+                track.attempt(provider, entry.model, key, "ok", attempt_start);
+                Some(Tap::new(
+                    Settle::new(state, entry, prompt_estimate, hints, &track, status),
                     injection.injected,
-                )
-            });
-            Body::from_stream(guarded_stream(state, entry, upstream, tap))
+                ))
+            } else {
+                track.attempt(
+                    provider,
+                    entry.model,
+                    key,
+                    &format!("http_{}", status.as_u16()),
+                    attempt_start,
+                );
+                track.end(status.as_u16(), None, Usage::default());
+                None
+            };
+            let first = (class == Class::Success).then(|| (Arc::clone(&track), attempt_start));
+            Body::from_stream(guarded_stream(state, entry, upstream, tap, first))
         } else {
             match upstream.bytes().await {
                 Ok(bytes) => {
                     if class == Class::Success {
                         state.limiter.record_success(&scope);
-                        let mut settle = Settle::new(state, entry, prompt_estimate, hints);
+                        track.attempt(provider, entry.model, key, "ok", attempt_start);
+                        track.first_byte(headers_elapsed);
+                        let mut settle =
+                            Settle::new(state, entry, prompt_estimate, hints, &track, status);
                         settle.usage = usage_from_body(&bytes);
                         settle.out_bytes = bytes.len() as u64;
+                        settle.completed = true;
                         // Records usage as it drops; the body is already
                         // fully buffered.
                         drop(settle);
+                    } else {
+                        track.attempt(
+                            provider,
+                            entry.model,
+                            key,
+                            &format!("http_{}", status.as_u16()),
+                            attempt_start,
+                        );
+                        track.end(status.as_u16(), None, Usage::default());
                     }
                     Body::from(bytes)
                 }
                 Err(_) if class == Class::Success => {
                     // Nothing has reached the client yet, so this can fail over.
+                    track.attempt(provider, entry.model, key, "body_error", attempt_start);
                     apply_failure(state, entry, Class::ServerError, None, "body_error");
                     continue;
                 }
-                Err(_) => return Err(upstream_unreachable(&provider.id)),
+                Err(_) => {
+                    track.attempt(provider, entry.model, key, "body_error", attempt_start);
+                    return Err(upstream_unreachable(&provider.id));
+                }
             }
         };
 
@@ -391,6 +446,7 @@ async fn forward(
                 attempts,
                 first_overhead.unwrap_or_default(),
             );
+            track.end(l.status.as_u16(), None, Usage::default());
             let mut response = Response::new(Body::from(l.body));
             *response.status_mut() = l.status;
             *response.headers_mut() = headers;
@@ -450,6 +506,13 @@ fn apply_failure(
         .get(entry.key_idx)
         .map_or_else(|| "?".to_string(), ApiKey::redacted);
     let now = Instant::now();
+    let events = &state.events;
+    if matches!(
+        class,
+        Class::RateLimited | Class::ServerError | Class::KeyRejected | Class::Missing
+    ) {
+        events.note_error(provider, Some(model), detail);
+    }
     match class {
         Class::RateLimited => {
             let scope = limiter::scope_key(entry.provider, entry.key_idx, model);
@@ -458,12 +521,20 @@ fn apply_failure(
                 "warn: cooldown provider={provider} key={key} model={model} for {}s (429)",
                 len.as_secs()
             );
+            events.route_state(provider, Some(model), Some(key), "cooldown", Some(len));
         }
         Class::ServerError => {
             if state.limiter.record_server_failure(provider, now) {
                 eprintln!(
                     "warn: circuit breaker open provider={provider} for {}s (last failure: {detail})",
                     limiter::BREAKER_OPEN.as_secs()
+                );
+                events.route_state(
+                    provider,
+                    None,
+                    None,
+                    "breaker_open",
+                    Some(limiter::BREAKER_OPEN),
                 );
             }
         }
@@ -472,11 +543,13 @@ fn apply_failure(
                 eprintln!(
                     "error: key disabled until restart provider={provider} key={key} (upstream {detail})"
                 );
+                events.route_state(provider, None, Some(key), "key_disabled", None);
             }
         }
         Class::Missing => {
             if state.limiter.mark_missing(provider, model) {
                 eprintln!("warn: model missing provider={provider} model={model} (upstream 404)");
+                events.route_state(provider, Some(model), None, "missing", None);
             }
         }
         Class::Success | Class::Passthrough => {}
@@ -494,6 +567,7 @@ fn guarded_stream(
     entry: &Entry<'_>,
     upstream: reqwest::Response,
     tap: Option<Tap>,
+    first_byte: Option<(Arc<ReqTrack>, Instant)>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> + use<> {
     let provider = entry.provider.id.clone();
     let error_event = Bytes::from(format!(
@@ -509,6 +583,7 @@ fn guarded_stream(
     let seed = StreamState {
         inner: Box::pin(upstream.bytes_stream()),
         tap,
+        first_byte,
         done: false,
         state: Arc::clone(state),
         provider,
@@ -520,16 +595,27 @@ fn guarded_stream(
         }
         loop {
             match st.inner.next().await {
-                Some(Ok(bytes)) => match st.tap.as_mut() {
-                    Some(tap) => {
-                        if let Some(out) = tap.push(bytes) {
-                            return Some((Ok(out), st));
-                        }
+                Some(Ok(bytes)) => {
+                    if let Some((track, since)) = st.first_byte.take() {
+                        track.first_byte(since.elapsed());
                     }
-                    None => return Some((Ok(bytes), st)),
-                },
+                    match st.tap.as_mut() {
+                        Some(tap) => {
+                            if let Some(out) = tap.push(bytes) {
+                                return Some((Ok(out), st));
+                            }
+                        }
+                        None => return Some((Ok(bytes), st)),
+                    }
+                }
                 Some(Err(_)) => {
                     st.done = true;
+                    if let Some(tap) = st.tap.as_mut() {
+                        tap.settle.failed = true;
+                    }
+                    st.state
+                        .events
+                        .note_error(&st.provider, None, "stream_interrupted");
                     if st
                         .state
                         .limiter
@@ -547,6 +633,9 @@ fn guarded_stream(
                 }
                 None => {
                     st.done = true;
+                    if let Some(tap) = st.tap.as_mut() {
+                        tap.settle.completed = true;
+                    }
                     let rest = st.tap.as_mut().and_then(Tap::finish);
                     return rest.map(|b| (Ok(b), st));
                 }
@@ -558,6 +647,9 @@ fn guarded_stream(
 struct StreamState {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     tap: Option<Tap>,
+    /// The request and when the serving attempt began, until the first
+    /// upstream byte arrives.
+    first_byte: Option<(Arc<ReqTrack>, Instant)>,
     done: bool,
     state: Arc<AppState>,
     provider: String,
@@ -577,6 +669,13 @@ struct Settle {
     hints: RemainingHints,
     usage: Option<Usage>,
     out_bytes: u64,
+    track: Arc<ReqTrack>,
+    /// Upstream status, which is also what the client got.
+    status: u16,
+    /// The response was delivered in full.
+    completed: bool,
+    /// The upstream failed after streaming began.
+    failed: bool,
 }
 
 impl Settle {
@@ -585,6 +684,8 @@ impl Settle {
         entry: &Entry<'_>,
         prompt_estimate: u64,
         hints: RemainingHints,
+        track: &Arc<ReqTrack>,
+        status: StatusCode,
     ) -> Self {
         Self {
             state: Arc::clone(state),
@@ -595,27 +696,38 @@ impl Settle {
             hints,
             usage: None,
             out_bytes: 0,
+            track: Arc::clone(track),
+            status: status.as_u16(),
+            completed: false,
+            failed: false,
         }
     }
 }
 
 impl Drop for Settle {
     fn drop(&mut self) {
-        let Some(provider) = self.state.config.provider(&self.provider) else {
-            return;
-        };
         let usage = self.usage.unwrap_or(Usage {
             input: self.prompt_estimate,
             output: self.out_bytes / 4,
         });
-        self.state.limiter.record_usage(
-            provider,
-            self.key_idx,
-            &self.model,
-            usage,
-            self.hints,
-            Instant::now(),
-        );
+        if let Some(provider) = self.state.config.provider(&self.provider) {
+            self.state.limiter.record_usage(
+                provider,
+                self.key_idx,
+                &self.model,
+                usage,
+                self.hints,
+                Instant::now(),
+            );
+        }
+        let error = if self.failed {
+            Some("stream_interrupted")
+        } else if self.completed {
+            None
+        } else {
+            Some("client_closed")
+        };
+        self.track.end(self.status, error, usage);
     }
 }
 
@@ -1201,7 +1313,15 @@ keys_env = \"K\"
             key_idx: 0,
             model: "m",
         };
-        let settle = Settle::new(&state, &entry, 0, RemainingHints::default());
+        let track = state.events.begin("m", true);
+        let settle = Settle::new(
+            &state,
+            &entry,
+            0,
+            RemainingHints::default(),
+            &track,
+            StatusCode::OK,
+        );
         Tap::new(settle, filter)
     }
 

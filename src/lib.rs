@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod limiter;
 pub mod proxy;
 pub mod select;
@@ -14,6 +15,7 @@ pub mod status;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -33,6 +35,10 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Cooldowns, breakers, disabled keys and missing routes.
     pub limiter: limiter::Limiter,
+    /// Event channel, recent-request ring buffer and request log.
+    pub events: Arc<events::Events>,
+    /// When the process started, for the uptime shown by `/status`.
+    pub started: Instant,
 }
 
 impl AppState {
@@ -43,6 +49,8 @@ impl AppState {
             config,
             http,
             limiter: limiter::Limiter::new(),
+            events: events::Events::new(),
+            started: Instant::now(),
         }))
     }
 }
@@ -76,9 +84,18 @@ pub async fn serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown)
-        .await
+    // One shared ticker for the `counters` event; idle without subscribers.
+    let ticker = tokio::spawn(status::ticker(state.clone()));
+    let events = state.events.clone();
+    let result = axum::serve(listener, app(state))
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            // `/events` streams never end by themselves.
+            events.shutdown();
+        })
+        .await;
+    ticker.abort();
+    result
 }
 
 async fn not_found() -> ApiError {

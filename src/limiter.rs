@@ -411,6 +411,24 @@ pub struct Snapshot {
     pub spend: Spend,
 }
 
+/// State of one provider, with deadlines as `Instant`s.
+#[derive(Debug, Default, Clone)]
+pub struct ProviderView {
+    pub paused: bool,
+    pub breaker_until: Option<Instant>,
+    /// Active cooldowns, soonest expiry first.
+    pub cooldowns: Vec<(ScopeKey, Instant)>,
+    /// Indices of disabled keys.
+    pub disabled_keys: Vec<usize>,
+    /// Upstream models marked missing.
+    pub missing: Vec<String>,
+    /// Counters of the provider's limit scope, summed over its buckets.
+    pub requests_minute: u64,
+    pub requests_day: u64,
+    pub tokens_minute: u64,
+    pub tokens_day: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Limiter {
     inner: Mutex<State>,
@@ -652,6 +670,81 @@ impl Limiter {
         } else {
             st.paused.remove(provider);
         }
+    }
+
+    /// Clear cooldowns and open breakers, for one provider or all. Returns
+    /// how many were cleared.
+    pub fn clear_cooldowns(&self, provider: Option<&str>) -> usize {
+        let mut st = self.lock();
+        let mut n = 0;
+        st.cooldowns.retain(|k, _| {
+            let hit = provider.is_none_or(|p| k.provider == p);
+            n += usize::from(hit);
+            !hit
+        });
+        for (id, b) in st.breakers.iter_mut() {
+            if provider.is_none_or(|p| id == p) {
+                n += usize::from(b.open_until.is_some());
+                *b = Breaker::default();
+            }
+        }
+        n
+    }
+
+    /// Read-only state of one provider for `/status` and `/events`.
+    pub fn provider_view(&self, provider: &Provider, now: Instant) -> ProviderView {
+        let st = self.lock();
+        let id = provider.id.as_str();
+        let mut view = ProviderView {
+            paused: st.paused.contains(id),
+            breaker_until: st
+                .breakers
+                .get(id)
+                .and_then(|b| b.open_until)
+                .filter(|u| *u > now),
+            ..ProviderView::default()
+        };
+        view.cooldowns = st
+            .cooldowns
+            .iter()
+            .filter(|(k, c)| k.provider == id && c.until > now)
+            .map(|(k, c)| (k.clone(), c.until))
+            .collect();
+        view.cooldowns.sort_by_key(|(_, until)| *until);
+        view.disabled_keys = st
+            .disabled
+            .iter()
+            .filter(|(p, _)| p == id)
+            .map(|(_, k)| *k)
+            .collect();
+        view.disabled_keys.sort_unstable();
+        view.missing = st
+            .missing
+            .iter()
+            .filter(|(p, _)| p == id)
+            .map(|(_, m)| m.clone())
+            .collect();
+        view.missing.sort();
+        let day = day_index(st.unix(now), provider.reset_utc_hour);
+        // Only the buckets of the provider's own scope, so route buckets
+        // that exist for per-model limits are not counted twice.
+        for (k, b) in st.buckets.iter().filter(|(k, _)| k.provider == id) {
+            let primary = match provider.limits.scope {
+                LimitScope::Provider => k.key.is_none(),
+                LimitScope::Key => k.key.is_some() && k.model.is_none(),
+                LimitScope::KeyModel => k.key.is_some() && k.model.is_some(),
+            };
+            if !primary {
+                continue;
+            }
+            view.requests_minute += window_sum(&b.win_req, now);
+            view.tokens_minute += window_sum(&b.win_tok, now);
+            if b.day == day {
+                view.requests_day += b.day_req;
+                view.tokens_day += b.day_tok;
+            }
+        }
+        view
     }
 
     /// Everything worth persisting. Disabled keys, missing routes, pauses and

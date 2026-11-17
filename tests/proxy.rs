@@ -1322,3 +1322,357 @@ async fn t16_restart_restores_day_counters_hourly_buckets_and_long_cooldowns() {
     assert_eq!(totals, (20, 10));
     let _ = std::fs::remove_file(&file);
 }
+
+// ---------------------------------------------------------------------------
+// M5: /status, /events, /v1/models, admin (T22, T23, T24, T26)
+// ---------------------------------------------------------------------------
+
+/// One parsed SSE event.
+#[derive(Debug, Clone)]
+struct Sse {
+    name: String,
+    data: Value,
+    raw: String,
+}
+
+fn parse_sse(buf: &mut String) -> Vec<Sse> {
+    let mut out = Vec::new();
+    while let Some(end) = buf.find("\n\n") {
+        let block: String = buf.drain(..end + 2).collect();
+        let mut name = String::new();
+        let mut data = String::new();
+        for line in block.lines() {
+            if let Some(v) = line.strip_prefix("event:") {
+                name = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data:") {
+                data = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&data) {
+            out.push(Sse {
+                name,
+                data: v,
+                raw: block,
+            });
+        }
+    }
+    out
+}
+
+async fn open_events(router: SocketAddr) -> reqwest::Response {
+    let r = client()
+        .get(format!("http://{router}/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(header(&r, "content-type").starts_with("text/event-stream"));
+    r
+}
+
+/// Read events (counters excluded) until a `request_end` arrives.
+async fn events_until_end(r: &mut reqwest::Response) -> Vec<Sse> {
+    let mut buf = String::new();
+    let mut all = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), r.chunk())
+            .await
+            .expect("event stream stalled")
+            .unwrap()
+            .expect("event stream ended");
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        for e in parse_sse(&mut buf) {
+            let end = e.name == "request_end";
+            if e.name != "counters" {
+                all.push(e);
+            }
+            if end {
+                return all;
+            }
+        }
+    }
+    panic!("no request_end");
+}
+
+async fn get_json(router: SocketAddr, path: &str) -> Value {
+    client()
+        .get(format!("http://{router}{path}"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap()
+}
+
+async fn admin(router: SocketAddr, path: &str) -> reqwest::Response {
+    client()
+        .post(format!("http://{router}{path}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t22_paused_provider_is_never_selected_until_resumed() {
+    let alpha = Mock::start(Reply::json(200, "{}")).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let body = json!({"model": "coder", "messages": []});
+
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/pause").await.status(),
+        200
+    );
+    for _ in 0..2 {
+        let r = post_json(router, &body).await;
+        assert_eq!(header(&r, "x-router-provider"), "beta");
+    }
+    assert_eq!(alpha.calls().len(), 0);
+    let status = get_json(router, "/status").await;
+    assert_eq!(status["providers"][0]["id"], "alpha");
+    assert_eq!(status["providers"][0]["state"], "paused");
+
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/resume").await.status(),
+        200
+    );
+    let r = post_json(router, &body).await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+    assert_eq!(
+        admin(router, "/admin/provider/nope/pause").await.status(),
+        404
+    );
+    assert_eq!(
+        admin(router, "/admin/cooldowns/clear?provider=nope")
+            .await
+            .status(),
+        404
+    );
+
+    // /v1/models: pools plus allowlisted ids (paid included); a provider
+    // without an allowlist adds nothing.
+    let models = get_json(router, "/v1/models").await;
+    assert_eq!(models["object"], "list");
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "coder",
+            "alpha/vendor/model-a",
+            "alpha/vendor/some-model:free",
+            "money/vendor/model-a-pro",
+            "money/vendor/model-a-noprice"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t22_clearing_cooldowns_makes_the_route_selectable_again() {
+    let alpha = Mock::start(Reply::Sequence(vec![
+        Reply::Full {
+            status: 429,
+            headers: vec![("retry-after", "30")],
+            body: b"{}".to_vec(),
+        },
+        Reply::json(200, "{}"),
+    ]))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let body = json!({"model": "coder", "messages": []});
+    let r = post_json(router, &body).await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    let status = get_json(router, "/status").await;
+    assert_eq!(status["providers"][0]["state"], "cooling");
+    let cleared = admin(router, "/admin/cooldowns/clear?provider=alpha").await;
+    assert_eq!(cleared.status(), 200);
+    let status = get_json(router, "/status").await;
+    assert_eq!(status["providers"][0]["state"], "ok");
+    let r = post_json(router, &body).await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t23_failover_publishes_events_in_order() {
+    let alpha = Mock::start(Reply::json(500, "{}")).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let mut sub = open_events(router).await;
+
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    let events = events_until_end(&mut sub).await;
+    let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "request_start",
+            "attempt",
+            "attempt",
+            "first_byte",
+            "request_end"
+        ]
+    );
+    assert_eq!(events[0].data["model"], "coder");
+    assert_eq!(events[1].data["provider"], "alpha");
+    assert_eq!(events[1].data["outcome"], "http_500");
+    assert_eq!(events[2].data["provider"], "beta");
+    assert_eq!(events[2].data["outcome"], "ok");
+    let end = &events[4].data;
+    assert_eq!(end["status"], 200);
+    assert_eq!(end["attempts"], 2);
+    assert_eq!(end["provider"], "beta");
+    let id = &events[0].data["id"];
+    assert!(events.iter().all(|e| &e.data["id"] == id));
+
+    let status = get_json(router, "/status").await;
+    let recent = &status["recent"][0];
+    assert_eq!(recent["in_flight"], false);
+    assert_eq!(recent["attempts"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t24_stalled_subscriber_does_not_slow_requests_and_is_dropped() {
+    let alpha = Mock::start(Reply::json(200, "{}")).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let (router, state) =
+        start_router_state(config(&alpha.base_url(), &beta.base_url(), ""), false).await;
+
+    // Connect to /events with a tiny receive buffer and never read.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stalled = socket.connect(router).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stalled, b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.events.receiver_count() == 0 {
+        assert!(Instant::now() < deadline, "subscriber never connected");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Flood events through 404s with long model names (no upstream calls).
+    let flood_client = client();
+    let long = "m".repeat(200);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (long, c) = (long.clone(), flood_client.clone());
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..1500 {
+                let r = c
+                    .post(format!("http://{router}/v1/chat/completions"))
+                    .body(json!({"model": long, "messages": []}).to_string())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 404);
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    // A real request is as fast as ever while the subscriber stalls.
+    let t0 = Instant::now();
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
+
+    // Once the client reads again the lagging stream has been cut off.
+    // The response body then ends with the chunked terminator.
+    let mut sink = vec![0u8; 64 * 1024];
+    let eof = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut tail: Vec<u8> = Vec::new();
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut stalled, &mut sink).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    tail.extend_from_slice(&sink[..n]);
+                    if tail.ends_with(b"0\r\n\r\n") {
+                        return;
+                    }
+                    let keep = tail.len().saturating_sub(16);
+                    tail.drain(..keep);
+                }
+            }
+        }
+    })
+    .await;
+    assert!(eof.is_ok(), "stalled subscriber was not dropped");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.events.receiver_count() != 0 {
+        assert!(Instant::now() < deadline, "receiver still registered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t26_status_and_events_carry_no_key_material_or_message_text() {
+    const PROMPT: &str = "TOP-SECRET-PROMPT-TEXT-91823";
+    let alpha = Mock::start(Reply::json(
+        200,
+        r#"{"choices":[{"message":{"content":"COMPLETION-TEXT-55512"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#,
+    ))
+    .await;
+    let beta = Mock::start(Reply::json(500, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let mut sub = open_events(router).await;
+
+    // One failing request (explicit route to beta) and one success through
+    // the pool, both carrying the prompt.
+    let msg = json!([{"role": "user", "content": PROMPT}]);
+    let r = post_json(
+        router,
+        &json!({"model": "beta/fallback-model", "messages": msg}),
+    )
+    .await;
+    assert_eq!(r.status(), 500);
+    let r = post_json(router, &json!({"model": "coder", "messages": msg})).await;
+    assert_eq!(r.status(), 200);
+    let mut raw = String::new();
+    for _ in 0..2 {
+        for e in events_until_end(&mut sub).await {
+            raw.push_str(&e.raw);
+        }
+    }
+    let status = get_json(router, "/status").await;
+    raw.push_str(&status.to_string());
+
+    for secret in [
+        ALPHA_KEY,
+        BETA_KEY,
+        PAID_KEY,
+        CLIENT_SECRET,
+        PROMPT,
+        "COMPLETION-TEXT-55512",
+        &ALPHA_KEY[..ALPHA_KEY.len() - 4],
+    ] {
+        assert!(!raw.contains(secret), "leaked {secret}");
+    }
+    assert!(
+        raw.contains(&ALPHA_KEY[ALPHA_KEY.len() - 4..]),
+        "suffix shown"
+    );
+    // The snapshot carries what the dashboard needs.
+    let alpha_p = &status["providers"][0];
+    assert_eq!(alpha_p["requests_day"], 1);
+    assert_eq!(alpha_p["tokens_in_today"], 7);
+    assert_eq!(alpha_p["tokens_out_today"], 3);
+    assert_eq!(alpha_p["hourly"].as_array().unwrap().len(), 24);
+    assert_eq!(alpha_p["models"][0]["requests_today"], 1);
+    assert!(alpha_p["ttft_ms"]["median"].is_number());
+    assert_eq!(status["recent"].as_array().unwrap().len(), 2);
+}

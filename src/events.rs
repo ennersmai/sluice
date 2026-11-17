@@ -23,6 +23,8 @@ use crate::limiter::{Usage, unix_secs};
 /// Broadcast channel capacity. A subscriber that falls this far behind is
 /// dropped (its SSE stream ends and the browser reconnects).
 pub const CHANNEL_CAPACITY: usize = 256;
+/// Most failed or skipped routes listed on a log line.
+const MAX_LOG_LIST: usize = 10;
 /// Requests kept for `/status`, in flight and finished.
 pub const RING_CAPACITY: usize = 200;
 /// Time to first token samples kept per provider.
@@ -305,19 +307,17 @@ impl Events {
     /// Print the log line of a request that failed before it was tracked
     /// (unreadable body or JSON).
     pub fn log_unrouted(&self, status: u16) {
-        println!(
-            "{}",
-            log_line(&LogEntry {
-                unix: unix_secs(SystemTime::now()),
-                requested: "-",
-                served: None,
-                status,
-                ttft_ms: None,
-                total: Duration::ZERO,
-                usage: Usage::default(),
-                attempts: 0,
-            })
-        );
+        crate::logsink::out(&log_line(&LogEntry {
+            unix: unix_secs(SystemTime::now()),
+            suffix: "",
+            requested: "-",
+            served: None,
+            status,
+            ttft_ms: None,
+            total: Duration::ZERO,
+            usage: Usage::default(),
+            attempts: 0,
+        }));
     }
 
     /// Newest first, with the in-flight and in-flight streaming counts.
@@ -405,6 +405,10 @@ struct TrackData {
     ttft_ms: Option<u64>,
     /// The latest route attempted.
     last: Option<Served>,
+    /// Failed attempts as `provider/model:reason`, for the log line.
+    fails: Vec<String>,
+    /// Routes skipped as ineligible (503), for the log line.
+    skipped: Vec<String>,
 }
 
 /// Handle for one request. Ends the request exactly once: explicitly through
@@ -439,6 +443,14 @@ impl ReqTrack {
         let n = {
             let mut d = self.data();
             d.attempts += 1;
+            if outcome != "ok" && d.fails.len() < MAX_LOG_LIST {
+                d.fails.push(format!(
+                    "{}/{}:{}",
+                    provider.id,
+                    model,
+                    outcome.strip_prefix("http_").unwrap_or(outcome)
+                ));
+            }
             d.last = Some(Served {
                 provider: provider.id.clone(),
                 model: model.to_string(),
@@ -474,6 +486,12 @@ impl ReqTrack {
             }
             v
         });
+    }
+
+    /// Remember routes skipped as ineligible (`provider/model:reason`) for
+    /// the log line of a 503.
+    pub fn skipped(&self, routes: impl IntoIterator<Item = String>) {
+        self.data().skipped = routes.into_iter().take(MAX_LOG_LIST).collect();
     }
 
     /// First upstream byte arrived, `ttft` after the serving attempt began.
@@ -513,9 +531,16 @@ impl ReqTrack {
             return;
         }
         let total = self.started.elapsed();
-        let (attempts, ttft_ms, served) = {
+        let (attempts, ttft_ms, served, suffix) = {
             let d = self.data();
-            (d.attempts, d.ttft_ms, d.last.clone())
+            let mut suffix = String::new();
+            if !d.fails.is_empty() {
+                suffix = format!(" fails={}", d.fails.join(","));
+            }
+            if !d.skipped.is_empty() {
+                suffix.push_str(&format!(" skipped={}", d.skipped.join(",")));
+            }
+            (d.attempts, d.ttft_ms, d.last.clone(), suffix)
         };
         let requested;
         {
@@ -556,21 +581,19 @@ impl ReqTrack {
                 "ttft_ms": ttft_ms, "duration_ms": millis(total), "attempts": attempts,
             })
         });
-        println!(
-            "{}",
-            log_line(&LogEntry {
-                unix: unix_secs(SystemTime::now()),
-                requested: &requested,
-                served: served
-                    .as_ref()
-                    .map(|s| (s.provider.as_str(), s.model.as_str(), s.paid)),
-                status,
-                ttft_ms,
-                total,
-                usage,
-                attempts,
-            })
-        );
+        crate::logsink::out(&log_line(&LogEntry {
+            unix: unix_secs(SystemTime::now()),
+            suffix: &suffix,
+            requested: &requested,
+            served: served
+                .as_ref()
+                .map(|s| (s.provider.as_str(), s.model.as_str(), s.paid)),
+            status,
+            ttft_ms,
+            total,
+            usage,
+            attempts,
+        }));
     }
 }
 
@@ -590,9 +613,11 @@ struct LogEntry<'a> {
     total: Duration,
     usage: Usage,
     attempts: u32,
+    /// ` fails=...` and/or ` skipped=...`, or empty.
+    suffix: &'a str,
 }
 
-/// PRD section 9:
+/// PRD section 9 plus the optional suffix:
 /// `2026-11-16T08:45:12Z coder -> nvidia/vendor/example-model 200 ttft=412ms total=3.1s in=1840 out=612 attempts=2 free`
 fn log_line(e: &LogEntry<'_>) -> String {
     let route = match e.served {
@@ -608,7 +633,7 @@ fn log_line(e: &LogEntry<'_>) -> String {
         .ttft_ms
         .map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
     format!(
-        "{} {} -> {} {} ttft={} total={:.1}s in={} out={} attempts={} {}",
+        "{} {} -> {} {} ttft={} total={:.1}s in={} out={} attempts={} {}{}",
         format_utc(e.unix),
         e.requested,
         route,
@@ -618,7 +643,8 @@ fn log_line(e: &LogEntry<'_>) -> String {
         e.usage.input,
         e.usage.output,
         e.attempts,
-        tier
+        tier,
+        e.suffix
     )
 }
 
@@ -656,6 +682,25 @@ mod tests {
     }
 
     #[test]
+    fn log_line_appends_the_failure_suffix() {
+        let line = log_line(&LogEntry {
+            unix: 1_000_000_000,
+            requested: "coder",
+            served: Some(("nvidia", "m", false)),
+            status: 200,
+            ttft_ms: None,
+            total: Duration::from_millis(100),
+            usage: Usage::default(),
+            attempts: 2,
+            suffix: " fails=groq/openai/gpt-oss-120b:429,nvidia/x:timeout",
+        });
+        assert!(
+            line.ends_with("attempts=2 free fails=groq/openai/gpt-oss-120b:429,nvidia/x:timeout"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn log_line_matches_the_prd_format() {
         let line = log_line(&LogEntry {
             unix: 1_000_000_000,
@@ -669,6 +714,7 @@ mod tests {
                 output: 612,
             },
             attempts: 2,
+            suffix: "",
         });
         assert_eq!(
             line,

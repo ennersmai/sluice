@@ -192,7 +192,7 @@ pub fn save(state: &AppState) -> io::Result<()> {
 /// Save, logging (never failing) on error.
 pub fn save_logged(state: &AppState) {
     if let Err(e) = save(state) {
-        eprintln!(
+        crate::elog!(
             "warn: cannot write state file {}: {e}",
             state.config.state_file.display()
         );
@@ -207,7 +207,7 @@ pub fn load(state: &AppState) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return,
         Err(e) => {
-            eprintln!("warn: cannot read state file {}: {e}", path.display());
+            crate::elog!("warn: cannot read state file {}: {e}", path.display());
             return;
         }
     };
@@ -220,12 +220,12 @@ pub fn load(state: &AppState) {
                 Instant::now(),
             );
         }
-        Ok(f) => eprintln!(
+        Ok(f) => crate::elog!(
             "warn: state file {} has unknown version {}, ignoring it",
             path.display(),
             f.version
         ),
-        Err(e) => eprintln!(
+        Err(e) => crate::elog!(
             "warn: state file {} is corrupt ({e}), starting fresh",
             path.display()
         ),

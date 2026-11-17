@@ -846,6 +846,75 @@ pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     Some(Duration::from_secs(whole.max(1)))
 }
 
+/// Parse an OpenAI/Groq style duration (`7.66s`, `2m59.56s`, `292ms`,
+/// `1h2m3s`; a bare number means seconds). Rounded up to whole milliseconds.
+pub fn parse_duration_hint(value: &str) -> Option<Duration> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let mut ms = 0.0_f64;
+    let mut rest = v;
+    while !rest.is_empty() {
+        let num_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let (num, tail) = rest.split_at(num_len);
+        let n: f64 = num.parse().ok().filter(|n: &f64| n.is_finite())?;
+        let unit_len = tail
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(tail.len());
+        let (unit, next) = tail.split_at(unit_len);
+        let scale = match unit {
+            "ms" => 1.0,
+            "" | "s" => 1000.0,
+            "m" => 60_000.0,
+            "h" => 3_600_000.0,
+            _ => return None,
+        };
+        ms += n * scale;
+        rest = next;
+    }
+    Some(Duration::from_millis(ms.ceil() as u64))
+}
+
+/// Cooldown from `x-ratelimit-reset-*` headers. Window kinds whose
+/// remaining count is 0 take precedence; otherwise the larger present value.
+pub fn reset_hint(
+    reset_requests: Option<&str>,
+    reset_tokens: Option<&str>,
+    remaining_requests: Option<u64>,
+    remaining_tokens: Option<u64>,
+) -> Option<Duration> {
+    let req = reset_requests.and_then(parse_duration_hint);
+    let tok = reset_tokens.and_then(parse_duration_hint);
+    let exhausted = [
+        req.filter(|_| remaining_requests == Some(0)),
+        tok.filter(|_| remaining_tokens == Some(0)),
+    ];
+    exhausted
+        .into_iter()
+        .flatten()
+        .max()
+        .or_else(|| req.into_iter().chain(tok).max())
+}
+
+/// The duration in "try again in 7.66s" inside an error body.
+pub fn body_hint(body: &[u8]) -> Option<Duration> {
+    const NEEDLE: &str = "try again in ";
+    let text = String::from_utf8_lossy(body.get(..body.len().min(16 * 1024)).unwrap_or_default())
+        .to_ascii_lowercase();
+    let at = text.find(NEEDLE)? + NEEDLE.len();
+    let token = text.get(at..)?.split_whitespace().next()?;
+    let token = token.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    parse_duration_hint(token)
+}
+
+/// Clamp a precise hint to between 1 s and 24 h.
+pub fn clamp_hint(d: Duration) -> Duration {
+    d.clamp(Duration::from_secs(1), MAX_RETRY_AFTER)
+}
+
 /// `Sun, 06 Nov 1994 08:49:37 GMT`.
 fn parse_http_date(v: &str) -> Option<SystemTime> {
     let parts: Vec<&str> = v.split_whitespace().collect();
@@ -1172,6 +1241,46 @@ mod tests {
         l.restore(snap, &|id| (id == "p").then_some(0u8), now);
         assert_eq!(l.snapshot(now), Snapshot::default());
         assert_eq!(l.spend_today(now), 0.0);
+    }
+
+    #[test]
+    fn duration_hint_parsing() {
+        let ms = |s: &str| parse_duration_hint(s).map(|d| d.as_millis());
+        assert_eq!(ms("7.66s"), Some(7660));
+        assert_eq!(ms("2m59.56s"), Some(179_560));
+        assert_eq!(ms("292ms"), Some(292));
+        assert_eq!(ms("292.5ms"), Some(293));
+        assert_eq!(ms("1h2m3s"), Some(3_723_000));
+        assert_eq!(ms("6m0s"), Some(360_000));
+        assert_eq!(ms("2"), Some(2000));
+        assert_eq!(ms(""), None);
+        assert_eq!(ms("abc"), None);
+        assert_eq!(ms("5x"), None);
+        assert_eq!(
+            body_hint(b"{\"message\":\"Rate limit. Please try again in 292.5ms. Visit\"}"),
+            Some(Duration::from_millis(293))
+        );
+        assert_eq!(
+            body_hint(b"Try again in 2m59.56s."),
+            Some(Duration::from_millis(179_560))
+        );
+        assert_eq!(body_hint(b"nothing"), None);
+        assert_eq!(
+            reset_hint(Some("1s"), Some("9s"), Some(5), Some(0)),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(
+            reset_hint(Some("1s"), Some("9s"), Some(0), Some(5)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            reset_hint(Some("1s"), Some("9s"), None, None),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(
+            clamp_hint(Duration::from_millis(292)),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

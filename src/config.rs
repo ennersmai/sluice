@@ -76,6 +76,8 @@ impl fmt::Debug for ApiKey {
 pub struct Config {
     pub bind: SocketAddr,
     pub state_file: PathBuf,
+    /// Also append request and warning lines to this file when set.
+    pub log_file: Option<PathBuf>,
     pub max_attempts: u32,
     pub first_byte_timeout_secs: u64,
     pub max_wait_secs: u64,
@@ -279,6 +281,8 @@ struct RawConfig {
     bind: String,
     #[serde(default = "default_state_file")]
     state_file: String,
+    #[serde(default)]
+    log_file: Option<String>,
     #[serde(default = "default_max_attempts")]
     max_attempts: u32,
     #[serde(default = "default_first_byte_timeout_secs")]
@@ -710,6 +714,10 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
     Ok(Config {
         bind,
         state_file: PathBuf::from(raw.state_file),
+        log_file: raw
+            .log_file
+            .filter(|f| !f.trim().is_empty())
+            .map(PathBuf::from),
         max_attempts: raw.max_attempts,
         first_byte_timeout_secs: raw.first_byte_timeout_secs,
         max_wait_secs: raw.max_wait_secs,

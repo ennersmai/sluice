@@ -1009,6 +1009,99 @@ async fn t9_400_is_returned_unchanged_without_retry_or_cooldown() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t27_413_fails_over_in_a_pool_without_cooldown_and_explicit_is_unchanged() {
+    let body = "{\"error\":{\"message\":\"Request too large ... Limit 8000, Requested 9000\",\"code\":\"rate_limit_exceeded\"}}";
+    let alpha = Mock::start(Reply::json(413, body)).await;
+    let beta = Mock::start(Reply::json(200, "{\"ok\":true}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+
+    for _ in 0..2 {
+        let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(header(&r, "x-router-provider"), "beta");
+        assert_eq!(header(&r, "x-router-attempts"), "2");
+    }
+    // No cooldown: alpha was asked both times.
+    assert_eq!(alpha.calls().len(), 2);
+
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/model-a", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 413);
+    assert_eq!(header(&r, "x-router-attempts"), "1");
+    assert_eq!(r.bytes().await.unwrap(), body.as_bytes());
+    assert_eq!(beta.calls().len(), 2);
+
+    // Every route too small: the last upstream response is returned.
+    let beta = Mock::start(Reply::json(413, "{\"last\":true}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 413);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(r.bytes().await.unwrap(), "{\"last\":true}".as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t27_context_length_400_fails_over_in_a_pool() {
+    let alpha = Mock::start(Reply::json(
+        400,
+        "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"nope\"}}",
+    ))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t28_429_cooldown_uses_reset_headers_then_body_text() {
+    // Reset headers: tokens are exhausted, so its 40.5 s wins over requests' 5 s.
+    let alpha = Mock::start(Reply::Full {
+        status: 429,
+        headers: vec![
+            ("content-type", "application/json"),
+            ("x-ratelimit-reset-requests", "5s"),
+            ("x-ratelimit-reset-tokens", "40.5s"),
+            ("x-ratelimit-remaining-requests", "3"),
+            ("x-ratelimit-remaining-tokens", "0"),
+        ],
+        body: b"{}".to_vec(),
+    })
+    .await;
+    let router = start_router(config(&alpha.base_url(), "http://127.0.0.1:9/v1", "")).await;
+    let ask = |router: SocketAddr| async move {
+        post_json(
+            router,
+            &json!({"model": "alpha/vendor/model-a", "messages": []}),
+        )
+        .await
+    };
+    assert_eq!(ask(router).await.status(), 429);
+    let r = ask(router).await;
+    assert_eq!(r.status(), 503);
+    let secs: u64 = header(&r, "retry-after").parse().unwrap();
+    assert!((40..=41).contains(&secs), "{secs}");
+
+    // Body text only.
+    let alpha = Mock::start(Reply::json(
+        429,
+        "{\"error\":{\"message\":\"Please try again in 2m10.5s. Visit billing.\"}}",
+    ))
+    .await;
+    let router = start_router(config(&alpha.base_url(), "http://127.0.0.1:9/v1", "")).await;
+    assert_eq!(ask(router).await.status(), 429);
+    let r = ask(router).await;
+    assert_eq!(r.status(), 503);
+    let secs: u64 = header(&r, "retry-after").parse().unwrap();
+    assert!((130..=131).contains(&secs), "{secs}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t12_all_routes_cooling_gives_503_with_reasons_and_retry_after() {
     let rate_limited = |secs: &'static str| Reply::Full {
         status: 429,

@@ -4,3 +4,4 @@ state.json
 state.json.tmp
 *.log
 router.toml
+sluice.log

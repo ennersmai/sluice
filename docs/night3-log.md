@@ -336,3 +336,19 @@ All grep checks from card pass:
 - **Tests:** none new; `shipped_example_file_is_valid` green.
 - **Suite:** fmt, clippy -D warnings clean; 195 passed.
 - **Adapted:** none beyond the example fix above.
+
+## Part 1 verification (supervisor, 2026-11-19)
+- **Build and config:** all cards SL-01 to SL-16a committed; 195 tests pass, clippy clean. router.toml updated from the audit (backup router.toml.before-billing-config): 9 providers `billing = "free"` (gemini, kilo, cohere, groq, cloudflare, zai, plus axforge, pollinations and llm7 on Mai's decision), 2 `billing = "credit"` (mistral: $10, reset day 18, seeded as spent on 2026-11-18; or-free: $1 key cap, reported cost from `usage.cost`). Gemini `reset_utc_hour = 8`, `rpd = 20` on three Flash models (unverified source). LLM7 `tpd = 100000`, `rpm = 60`; AxForge `tpmo = 3000000`. All 39 pulled routes restored: coder 28, chat 50.
+- **Restart:** new binary started cleanly ("11 providers, 2 pools").
+- **Test request to coder:** 200 from gemini/gemini-4-hydrogen, 1 attempt.
+- **Mistral skipped with a credit reason:** /status shows mistral `state = credit_exhausted`, spent 10.00 of 10.00 (guard 9.00), resets 2026-12-18. An explicit `mistral/codestral-latest` request returns 503 with reason `credit_exhausted` and no upstream call.
+- **Every provider shows a billing type:** yes, all 11 in /status and on the dashboard.
+- **Estimated spend visible:** `spend_today_usd` at top level and per provider (0.00 so far), and per-period credit spend for mistral and or-free (0.00 of 1.00, guard 0.90).
+- **Result:** Part 1 verified. Part 2 starts.
+
+### Provider audit update (Mai's decisions, 2026-11-19)
+| Provider | Billing | Evidence |
+|---|---|---|
+| llm7 | free | Mai: 100,000 free tokens a day; paid models need a manual prepaid top-up, otherwise requests fail with 429. Limits set: tpd 100000, rpm 60. |
+| pollinations | free | Mai: strictly balance-based (Pollen); Mai sets the API key's spending cap to 0. |
+| axforge | free | Mai: 3M tokens per 30 days, no card collected, requests rejected when exhausted. tpmo 3000000; trains_on_input = true (zero-trust). |

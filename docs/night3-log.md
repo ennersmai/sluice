@@ -273,3 +273,10 @@ All grep checks from card pass:
 - **What:** `CREDIT_GUARD_FRACTION = 0.9`. A credit provider whose period spend is at or above 90% of `credit_usd` is skipped before any upstream call with skip reason `credit_exhausted`; a warn line and event are emitted once when the threshold is crossed. `paid_daily_cap_usd` handling is unchanged.
 - **Tests:** `credit_spend_reaching_90_percent_makes_provider_ineligible`, `credit_resets_on_the_reset_day` (reset day 31 falls on the last day of short months). Suite: 179 passed, clippy clean.
 - **Note:** implemented by an OpenCode session that stopped before committing; verified and committed by the supervisor. From SL-07 on, Mai asked the supervisor to finish the Sluice work directly (the OpenCode CLI was hanging on runs started with a custom session id).
+
+## SL-07: Seed credit already spent this period from config
+- **Files:** src/limiter.rs, src/lib.rs, tests/proxy.rs
+- **What:** `Limiter::seed_credit(provider, now) -> bool` applies `credit_spent_usd` as a floor (`max(current, seed)`) on the current credit period when `credit_spent_date` (end of that UTC day) falls in it; otherwise returns false. `AppState::new` seeds every provider with a seed and logs `warn: credit_spent_date for provider=.. is from an earlier credit period, ignored` when it does not apply. `restore` already merges with max, so seed/load order does not matter.
+- **Tests:** `credit_seed_applies_only_within_its_period_and_never_double_counts` (limiter), `credit_seed_from_config_makes_the_provider_ineligible` (tests/proxy.rs).
+- **Suite:** fmt, clippy -D warnings clean; 181 passed (119 unit + 5 main + 1 bench + 2 dashboard + 4 health + 50 proxy).
+- **Adapted:** none.

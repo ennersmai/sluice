@@ -2239,3 +2239,28 @@ routes = ["beta/fallback-model"]
 
     let _ = std::fs::remove_file(&file);
 }
+
+// ---------------------------------------------------------------------------
+// SL-07: credit already spent outside sluice, seeded from config
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credit_seed_from_config_makes_the_provider_ineligible() {
+    let alpha = Mock::start(Reply::json(200, "{}")).await;
+    let beta = Mock::start(usage_reply()).await;
+    let now = sluice::limiter::unix_secs(std::time::SystemTime::now());
+    let today = &sluice::events::format_utc(now)[..10];
+    let extra = format!(
+        "billing = \"credit\"\ncredit_usd = 10.0\ncredit_reset_day = 1\ncredit_spent_usd = 10.0\ncredit_spent_date = \"{today}\"\n[provider.prices.\"fallback-model\"]\nin_per_mtok = 1.0\nout_per_mtok = 0.0\n"
+    );
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), &extra)).await;
+    let r = post_json(
+        router,
+        &json!({"model": "beta/fallback-model", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "credit_exhausted");
+    assert!(beta.calls().is_empty());
+}

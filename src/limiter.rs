@@ -819,6 +819,42 @@ impl Limiter {
             .unwrap_or(0.0)
     }
 
+    /// Apply the config seed (`credit_spent_usd` on `credit_spent_date`) as a
+    /// floor on this period's credit spend. Applies only when the seed date
+    /// falls in the current credit period; returns false otherwise (or when
+    /// there is no seed). Idempotent: `max(current, seed)` never double-counts.
+    pub fn seed_credit(&self, provider: &Provider, now: Instant) -> bool {
+        let Some(seed) = provider.credit.as_ref().and_then(|c| c.seed) else {
+            return false;
+        };
+        let seed_unix = u64::try_from(
+            seed.day
+                .saturating_mul(86_400)
+                .saturating_add(86_399)
+                .max(0),
+        )
+        .unwrap_or(0);
+        let mut st = self.lock();
+        let unix = st.unix(now);
+        let h = provider.reset_utc_hour;
+        let d = provider.month_reset_day;
+        let period_start = crate::billing::month_start(unix, d, h);
+        if crate::billing::month_start(seed_unix, d, h) != period_start {
+            return false;
+        }
+        let cs = st.credit.entry(provider.id.clone()).or_default();
+        let current = if cs.period_start == period_start {
+            cs.usd
+        } else {
+            0.0
+        };
+        *cs = CreditSpend {
+            period_start,
+            usd: current.max(seed.usd),
+        };
+        true
+    }
+
     /// Full credit status for the current credit period, including whether
     /// the guard fraction has been reached.
     pub fn credit_status(&self, provider: &Provider, now: Instant) -> Option<CreditStatus> {
@@ -1898,5 +1934,65 @@ out_per_mtok = 0.0
             "provider should be eligible after reset: {:?}",
             skip
         );
+    }
+    fn credit_cfg(seed: &str) -> Config {
+        let text = format!(
+            "[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\nbilling = \"credit\"\ncredit_usd = 10.0\ncredit_reset_day = 1\n{seed}\n[provider.prices.\"m\"]\nin_per_mtok = 1.0\nout_per_mtok = 0.0\n"
+        );
+        Config::from_toml_str(&text, &|_| Some("key-aaaa-0001".to_string()))
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn credit_seed_applies_only_within_its_period_and_never_double_counts() {
+        // 2026-11-18 12:00 UTC
+        let wall = UNIX_EPOCH + Duration::from_secs(20_775 * 86_400 + 12 * 3600);
+        let now = Instant::now();
+
+        // $10 dated 2026-11-05 applies and exhausts a $10 credit.
+        let c = credit_cfg("credit_spent_usd = 10.0\ncredit_spent_date = \"2026-11-05\"");
+        let p = &c.providers[0];
+        let l = Limiter::with_anchor(now, wall);
+        assert!(l.seed_credit(p, now));
+        assert!((l.credit_spent(p, now) - 10.0).abs() < 1e-9);
+        assert_eq!(
+            l.skip_reason(p, 0, "m", 0, now).map(|s| s.name()),
+            Some("credit_exhausted")
+        );
+
+        // A seed from the previous period is ignored.
+        let c = credit_cfg("credit_spent_usd = 10.0\ncredit_spent_date = \"2026-10-31\"");
+        let p = &c.providers[0];
+        let l = Limiter::with_anchor(now, wall);
+        assert!(!l.seed_credit(p, now));
+        assert_eq!(l.credit_spent(p, now), 0.0);
+        assert!(l.skip_reason(p, 0, "m", 0, now).is_none());
+
+        // Seed $3, then $2 of usage: $5. Restoring that snapshot into a
+        // fresh, seeded limiter still gives $5, not $8.
+        let c = credit_cfg("credit_spent_usd = 3.0\ncredit_spent_date = \"2026-11-05\"");
+        let p = &c.providers[0];
+        let l = Limiter::with_anchor(now, wall);
+        assert!(l.seed_credit(p, now));
+        let usage = Usage {
+            input: 2_000_000,
+            output: 0,
+        };
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
+        assert!((l.credit_spent(p, now) - 5.0).abs() < 1e-9);
+        let snap = l.snapshot(now);
+        let fresh = Limiter::with_anchor(now, wall);
+        assert!(fresh.seed_credit(p, now));
+        fresh.restore(
+            snap,
+            &|id| (id == "p").then_some(0),
+            &|id, unix| (id == "p").then(|| crate::billing::month_start(unix, 1, 0)),
+            &|_, _| true,
+            now,
+        );
+        assert!((fresh.credit_spent(p, now) - 5.0).abs() < 1e-9);
+        // Seeding again after the restore does not change it either.
+        assert!(fresh.seed_credit(p, now));
+        assert!((fresh.credit_spent(p, now) - 5.0).abs() < 1e-9);
     }
 }

@@ -48,12 +48,24 @@ impl AppState {
     /// Fails only if the upstream HTTP client cannot be built (startup error).
     pub fn new(config: Config) -> Result<Arc<Self>, String> {
         let http = proxy::build_client()?;
+        let limiter = limiter::Limiter::new();
+        let now = Instant::now();
+        // Config seeds of credit already spent this period; a floor, so the
+        // order relative to loading the state file does not matter.
+        for p in &config.providers {
+            if p.credit.as_ref().is_some_and(|c| c.seed.is_some()) && !limiter.seed_credit(p, now) {
+                crate::elog!(
+                    "warn: credit_spent_date for provider={} is from an earlier credit period, ignored",
+                    p.id
+                );
+            }
+        }
         Ok(Arc::new(Self {
             config,
             http,
-            limiter: limiter::Limiter::new(),
+            limiter,
             events: events::Events::new(),
-            started: Instant::now(),
+            started: now,
         }))
     }
 }

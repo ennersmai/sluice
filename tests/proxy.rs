@@ -1206,7 +1206,10 @@ async fn learned_ceiling_skips_larger_requests_without_an_upstream_call() {
     // Clearing forgets the ceiling.
     let r = admin(router, "/admin/ceilings/clear?provider=alpha").await;
     assert_eq!(r.status(), 200);
-    let r = post_json(router, &big(60_000)).await;
+    // A different conversation (an identical one would stick to beta).
+    let other =
+        json!({"model": "coder", "messages": [{"role": "user", "content": "y".repeat(60_000)}]});
+    let r = post_json(router, &other).await;
     assert_eq!(header(&r, "x-router-provider"), "alpha");
 }
 
@@ -2402,4 +2405,101 @@ async fn gemini_per_day_429_stops_upstream_calls_until_the_daily_reset() {
     let retry_after: u64 = header(&r, "retry-after").parse().unwrap();
     assert!((36..=37).contains(&retry_after), "{retry_after}");
     assert_eq!(beta.calls().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// SL-12: session stickiness
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_sticks_to_its_route_while_healthy_and_moves_when_it_cools() {
+    let alpha = Mock::start(Reply::json(200, "{}")).await;
+    let beta = Mock::start(Reply::Sequence(vec![
+        Reply::json(200, "{}"),
+        Reply::json(200, "{}"),
+        Reply::Full {
+            status: 429,
+            headers: vec![("retry-after", "60")],
+            body: b"{}".to_vec(),
+        },
+        Reply::json(200, "{}"),
+    ]))
+    .await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let body = json!({"model": "coder", "messages": []});
+    let as_session = |s: &'static str| {
+        let body = body.clone();
+        async move { post_with(router, &body, &[("x-session-id", s)]).await }
+    };
+
+    // 1. alpha paused: s1 starts on beta.
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/pause").await.status(),
+        200
+    );
+    let r = as_session("s1").await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/resume").await.status(),
+        200
+    );
+
+    // 2. s1 stays on beta although alpha has priority.
+    let r = as_session("s1").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+
+    // 3. A new session follows the normal order.
+    let r = as_session("s2").await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+
+    // 4. beta cools down: s1 fails over to alpha.
+    let r = as_session("s1").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+
+    // 5. Even with beta usable again, s1 is now stuck to alpha.
+    assert_eq!(admin(router, "/admin/cooldowns/clear").await.status(), 200);
+    let r = as_session("s1").await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+    assert_eq!(beta.calls().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derived_session_key_sticks_without_a_header() {
+    let alpha = Mock::start(Reply::json(200, "{}")).await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let convo = |first: &str| {
+        json!({"model": "coder", "messages": [
+            {"role": "system", "content": "you are a coder"},
+            {"role": "user", "content": first}
+        ]})
+    };
+
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/pause").await.status(),
+        200
+    );
+    let r = post_json(router, &convo("fix the bug")).await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/resume").await.status(),
+        200
+    );
+
+    // Same opening messages: same session, still beta.
+    let r = post_json(router, &convo("fix the bug")).await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    // A different conversation follows the normal order.
+    let r = post_json(router, &convo("write a poem")).await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+    // Explicit routes are never affected.
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/model-a", "messages": [{"role": "user", "content": "fix the bug"}]}),
+    )
+    .await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
 }

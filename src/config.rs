@@ -102,6 +102,11 @@ pub struct Config {
     /// Bearer token required from clients. `Some` exactly when `bind` is not
     /// a loopback address (then it is mandatory); `None` on loopback.
     pub client_auth: Option<ApiKey>,
+    /// Request headers that name a session for stickiness, lowercased, in
+    /// order of preference.
+    pub session_headers: Vec<String>,
+    /// How long a session stays stuck to its route; 0 disables stickiness.
+    pub sticky_ttl_secs: u64,
 }
 
 impl Config {
@@ -366,6 +371,12 @@ fn default_stream_idle_timeout_secs() -> u64 {
 fn default_max_wait_secs() -> u64 {
     15
 }
+fn default_session_headers() -> Vec<String> {
+    vec!["x-session-id".to_string(), "x-opencode-session".to_string()]
+}
+fn default_sticky_ttl_secs() -> u64 {
+    7200
+}
 fn default_scope() -> String {
     "provider".to_string()
 }
@@ -394,6 +405,10 @@ struct RawConfig {
     private_default: bool,
     #[serde(default)]
     paid_daily_cap_usd: f64,
+    #[serde(default = "default_session_headers")]
+    session_headers: Vec<String>,
+    #[serde(default = "default_sticky_ttl_secs")]
+    sticky_ttl_secs: u64,
     #[serde(default, rename = "provider")]
     providers: Vec<RawProvider>,
     #[serde(default, rename = "pool")]
@@ -568,6 +583,18 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
             SocketAddr::from(([127, 0, 0, 1], 8787))
         }
     };
+
+    let mut session_headers = Vec::new();
+    for h in &raw.session_headers {
+        let valid = !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if valid {
+            session_headers.push(h.to_ascii_lowercase());
+        } else {
+            problems.push(format!(
+                "session_headers entry \"{h}\" is not a valid header name"
+            ));
+        }
+    }
 
     let mut client_auth = None;
     if !bind.ip().is_loopback() {
@@ -1011,6 +1038,8 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
         providers,
         pools,
         client_auth,
+        session_headers,
+        sticky_ttl_secs: raw.sticky_ttl_secs,
     })
 }
 

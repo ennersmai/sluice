@@ -33,7 +33,7 @@ use crate::config::{ApiKey, Provider, Strategy};
 use crate::error::ApiError;
 use crate::events::ReqTrack;
 use crate::limiter::{self, RemainingHints, Usage};
-use crate::select::{Entry, ReqInfo, Skipped};
+use crate::select::{self, Entry, ReqInfo, Skipped};
 
 /// Request body limit for `/v1/chat/completions`. axum's 2 MB default is far
 /// too small for agent requests that carry large contexts.
@@ -251,6 +251,16 @@ async fn forward(
     };
     let is_pool = pool.is_some();
 
+    let session = if is_pool {
+        session_key(
+            client_headers,
+            &state.config.session_headers,
+            &requested,
+            fields,
+        )
+    } else {
+        None
+    };
     let injection = inject_usage_option(fields, wants_stream);
     let (prompt_estimate, estimate) = estimate_tokens(fields);
     let req = ReqInfo {
@@ -262,7 +272,7 @@ async fn forward(
     // The future is dropped if the client disconnects, which ends the wait.
     let max_wait = Duration::from_secs(state.config.max_wait_secs);
     let mut wait_deadline: Option<Instant> = None;
-    let plan = loop {
+    let mut plan = loop {
         let now = Instant::now();
         let plan = state.limiter.plan(&resolution.candidates, pool, &req, now);
         if !plan.eligible.is_empty() {
@@ -281,6 +291,12 @@ async fn forward(
             }
         }
     };
+
+    if let Some(k) = session
+        && let Some((p, m)) = state.sticky.get(k, Instant::now())
+    {
+        select::prefer(&mut plan.eligible, &p, &m);
+    }
 
     let max_attempts = state.config.max_attempts.max(1);
     let first_byte_timeout = Duration::from_secs(state.config.first_byte_timeout_secs);
@@ -458,6 +474,10 @@ async fn forward(
         let body = if wants_stream || is_event_stream {
             let tap = if class == Class::Success {
                 state.limiter.record_success(&scope, entry.model);
+                if let Some(k) = session {
+                    let now = Instant::now();
+                    state.sticky.set(k, &provider.id, entry.model, now);
+                }
                 track.attempt(provider, entry.model, key, "ok", attempt_start);
                 Some(Tap::new(
                     Settle::new(state, entry, prompt_estimate, hints, &track, status),
@@ -498,6 +518,10 @@ async fn forward(
                 Ok(bytes) => {
                     if class == Class::Success {
                         state.limiter.record_success(&scope, entry.model);
+                        if let Some(k) = session {
+                            let now = Instant::now();
+                            state.sticky.set(k, &provider.id, entry.model, now);
+                        }
                         track.attempt(provider, entry.model, key, "ok", attempt_start);
                         track.first_byte(first_elapsed);
                         let mut settle =
@@ -585,6 +609,50 @@ async fn forward(
         }
         None => Err(upstream_unreachable(&last_provider)),
     }
+}
+
+/// Longest prefix (in chars) of a message's JSON text that feeds a derived
+/// session key.
+const SESSION_PREFIX_CHARS: usize = 4096;
+
+/// The stickiness key of a pool request (see `sticky.rs`): the first
+/// non-empty configured session header, else a hash of the first
+/// system/developer and first user message. Only the hash leaves here.
+fn session_key(
+    headers: &HeaderMap,
+    names: &[String],
+    requested: &str,
+    fields: &Map<String, Value>,
+) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    let from_header = names.iter().find_map(|n| {
+        headers
+            .get(n.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    });
+    if let Some(value) = from_header {
+        ("h", requested, value).hash(&mut h);
+        return Some(h.finish());
+    }
+    let messages = fields.get("messages")?.as_array()?;
+    let first = |roles: &[&str]| {
+        messages
+            .iter()
+            .find(|m| {
+                m.get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| roles.contains(&r))
+            })
+            .and_then(|m| serde_json::to_string(m).ok())
+            .map(|s| s.chars().take(SESSION_PREFIX_CHARS).collect::<String>())
+    };
+    let user = first(&["user"])?;
+    let system = first(&["system", "developer"]);
+    ("d", requested, system, user).hash(&mut h);
+    Some(h.finish())
 }
 
 /// Serialise the request for one entry: `model` rewritten, the provider's
@@ -1742,6 +1810,47 @@ fn internal(message: impl Into<String>) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_key_prefers_header_then_derives_from_first_messages() {
+        let names = vec!["x-session-id".to_string(), "x-opencode-session".to_string()];
+        let none = HeaderMap::new();
+        let fields = |v: Value| v.as_object().cloned().unwrap_or_default();
+        let base = fields(json!({"messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"}
+        ]}));
+        let key = |h: &HeaderMap, f: &Map<String, Value>| session_key(h, &names, "coder", f);
+
+        let a = key(&none, &base);
+        assert!(a.is_some());
+        assert_eq!(a, key(&none, &base.clone()));
+
+        let other = fields(json!({"messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "goodbye"}
+        ]}));
+        assert_ne!(a, key(&none, &other));
+
+        let longer = fields(json!({"messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "more"}
+        ]}));
+        assert_eq!(a, key(&none, &longer));
+
+        let mut with = HeaderMap::new();
+        with.insert("x-opencode-session", HeaderValue::from_static("s1"));
+        let h = key(&with, &base);
+        assert!(h.is_some());
+        assert_ne!(h, a);
+        assert_eq!(h, key(&with, &other), "the header overrides the messages");
+
+        let no_user = fields(json!({"messages": [{"role": "system", "content": "x"}]}));
+        assert_eq!(key(&none, &no_user), None);
+        assert_eq!(key(&none, &fields(json!({}))), None);
+    }
 
     #[test]
     fn error_excerpt_is_bounded_single_line_and_redacts_keys() {

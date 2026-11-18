@@ -15,10 +15,11 @@ pub mod proxy;
 pub mod select;
 pub mod state;
 pub mod status;
+pub mod sticky;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -42,6 +43,8 @@ pub struct AppState {
     pub events: Arc<events::Events>,
     /// When the process started, for the uptime shown by `/status`.
     pub started: Instant,
+    /// Session -> route stickiness for pool requests.
+    pub sticky: sticky::Sticky,
 }
 
 impl AppState {
@@ -60,12 +63,14 @@ impl AppState {
                 );
             }
         }
+        let sticky = sticky::Sticky::new(Duration::from_secs(config.sticky_ttl_secs));
         Ok(Arc::new(Self {
             config,
             http,
             limiter,
             events: events::Events::new(),
             started: now,
+            sticky,
         }))
     }
 }

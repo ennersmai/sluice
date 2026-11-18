@@ -189,6 +189,13 @@ pub fn select<'a>(
     out
 }
 
+/// Move the entries of the sticky route `provider/model` to the front,
+/// keeping the relative order of everything else. Only reorders entries that
+/// are already eligible.
+pub fn prefer(eligible: &mut [Entry<'_>], provider: &str, model: &str) {
+    eligible.sort_by_key(|e| !(e.provider.id == provider && e.model == model));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +392,24 @@ routes = ["a/m1", "b/m2"]
         assert_eq!(q(Some(now)).until(), Some(now));
         assert_eq!(q(None).until(), None);
         assert_eq!(q(None).name(), "quota_rpm");
+    }
+
+    #[test]
+    fn prefer_moves_the_sticky_route_first_and_keeps_order() {
+        let cfg = config();
+        let now = Instant::now();
+        let mut sel = select(
+            &cands(&cfg),
+            Strategy::Priority,
+            0,
+            &ReqInfo::default(),
+            &Fake::default(),
+            now,
+        );
+        assert_eq!(ids(&sel), ["a0/m1", "a1/m1", "b0/m2"]);
+        prefer(&mut sel.eligible, "b", "m2");
+        assert_eq!(ids(&sel), ["b0/m2", "a0/m1", "a1/m1"]);
+        prefer(&mut sel.eligible, "zz", "m9");
+        assert_eq!(ids(&sel), ["b0/m2", "a0/m1", "a1/m1"]);
     }
 }

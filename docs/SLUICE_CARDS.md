@@ -603,3 +603,13 @@ Change:
 Tests: none new. Run `cargo test --locked`; T25 must still pass (file under 60 KB, no http(s) URLs).
 Done when: `cargo test --locked` passes; `node --check` passes on the script extracted from ui/index.html; `grep -c "Show fewer" ui/index.html` is at least 1.
 Do not: change any Rust file, the /status or /events payloads, or the status colours. Do not add external fonts or scripts.
+
+---
+
+ID: SL-16a
+Goal: Fix two provider colours from SL-16 that read as status colours (supervisor review of SL-16).
+Files: `ui/index.html` only.
+Change: in the `:root` block, `--prov-4` is `#f97316` (a bright orange, reads as a warning) and `--prov-7` is `#fda4af` (a rose, reads as reddish). Replace them with `#94a3b8` (slate) and `#818cf8` (indigo), and update their comments to say slate and indigo. Change nothing else.
+Tests: none new. Run `cargo test --locked`.
+Done when: `cargo test --locked` passes, and `grep -ciE "\-\-prov-[0-9]+:#(f97316|fda4af)" ui/index.html` prints 0.
+Do not: change any other colour, the status colours, or any other file.

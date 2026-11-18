@@ -958,6 +958,39 @@ async fn t6_headers_then_stalled_body_fails_over() {
     assert!(r.text().await.unwrap().contains("\"from\":\"beta\""));
 }
 
+/// Only `: keepalive` comments past the first-byte timeout: not a first byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keepalive_comments_do_not_count_as_first_byte() {
+    let alpha = Mock::start(Reply::Stream(
+        (0..6)
+            .map(|_| (Duration::from_millis(400), b": keepalive\n\n".to_vec()))
+            .collect(),
+    ))
+    .await;
+    let beta = Mock::start(Reply::Stream(vec![(
+        Duration::from_millis(10),
+        b"data: {\"from\":\"beta\"}\n\n".to_vec(),
+    )]))
+    .await;
+    let router = start_router(config_full(
+        "first_byte_timeout_secs = 1",
+        &alpha.base_url(),
+        &beta.base_url(),
+        "",
+        ALPHA_KEY,
+    ))
+    .await;
+
+    let r = post_json(
+        router,
+        &json!({"model": "coder", "stream": true, "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert!(r.text().await.unwrap().contains("\"from\":\"beta\""));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_idle_timeout_emits_error_event_and_closes() {
     let alpha = Mock::start(Reply::Stream(vec![

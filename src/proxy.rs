@@ -358,7 +358,11 @@ async fn forward(
         if is_pool && class == Class::Passthrough && matches!(status.as_u16(), 400 | 422) {
             // A 400/422 only fails over when it says the request is too big.
             let mut headers = forwarded_response_headers(upstream.headers());
-            let body = read_capped(upstream).await;
+            let Ok(body) = tokio::time::timeout_at(deadline, read_capped(upstream)).await else {
+                track.attempt(provider, entry.model, key, "timeout", attempt_start);
+                apply_failure(state, entry, Class::ServerError, None, "timeout");
+                continue;
+            };
             if looks_too_large(&body) {
                 track.attempt(provider, entry.model, key, "too_large", attempt_start);
                 last = Some(LastError {
@@ -384,7 +388,11 @@ async fn forward(
                 .then(|| header_hint(upstream.headers()))
                 .flatten();
             let headers = forwarded_response_headers(upstream.headers());
-            let body = read_capped(upstream).await;
+            let Ok(body) = tokio::time::timeout_at(deadline, read_capped(upstream)).await else {
+                track.attempt(provider, entry.model, key, "timeout", attempt_start);
+                apply_failure(state, entry, Class::ServerError, None, "timeout");
+                continue;
+            };
             let retry_after = match (class, hint) {
                 (_, Some(d)) => Some(d),
                 (Class::RateLimited, None) => limiter::body_hint(&body).map(limiter::clamp_hint),
@@ -588,7 +596,7 @@ enum FirstByteError {
 }
 
 /// Send the request and, for a 2xx response, wait for the first non-empty
-/// body chunk (SSE comment keep-alives count as bytes). Other statuses
+/// body chunk (SSE comment lines do not count). Other statuses
 /// return as soon as the headers arrive. Run under the first-byte deadline.
 async fn await_first_byte(
     send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
@@ -597,15 +605,62 @@ async fn await_first_byte(
     if !response.status().is_success() {
         return Ok((response, None));
     }
+    // Comment-only bytes (`: keep-alive` lines) are held back and forwarded
+    // together with the first real chunk; they do not stop the deadline.
+    let mut held: Vec<u8> = Vec::new();
+    let mut scan = LineScan::default();
     loop {
         match response.chunk().await {
-            Ok(Some(c)) if c.is_empty() => {}
-            Ok(Some(c)) => return Ok((response, Some(c))),
-            Ok(None) => return Ok((response, None)),
+            Ok(Some(c)) => {
+                let data = scan.feed(&c);
+                held.extend_from_slice(&c);
+                if data {
+                    return Ok((response, Some(Bytes::from(held))));
+                }
+            }
+            Ok(None) => {
+                let rest = (!held.is_empty()).then(|| Bytes::from(held));
+                return Ok((response, rest));
+            }
             Err(_) => return Err(FirstByteError::Body),
         }
     }
 }
+
+/// Tracks line starts across chunks to tell whether bytes carry a line that
+/// is neither empty nor an SSE comment (`:` prefix).
+struct LineScan {
+    at_line_start: bool,
+}
+
+impl Default for LineScan {
+    fn default() -> Self {
+        Self {
+            at_line_start: true,
+        }
+    }
+}
+
+impl LineScan {
+    /// Feed bytes; true when a non-empty, non-comment line has started.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut data = false;
+        for &b in bytes {
+            if self.at_line_start && b != b':' && b != b'\n' && b != b'\r' {
+                data = true;
+            }
+            if self.at_line_start && b == b'\r' {
+                continue;
+            }
+            self.at_line_start = b == b'\n';
+        }
+        data
+    }
+}
+
+/// With only comment lines arriving, a stream is cut after this many idle
+/// periods.
+const COMMENT_ONLY_IDLE_FACTOR: u32 = 5;
 
 enum ChunkError {
     Idle,
@@ -766,6 +821,8 @@ fn guarded_stream(
         provider,
         model: entry.model.to_string(),
         idle,
+        scan: LineScan::default(),
+        data_deadline: Instant::now() + idle * COMMENT_ONLY_IDLE_FACTOR,
         error_event,
         idle_event,
     };
@@ -777,8 +834,18 @@ fn guarded_stream(
             let next = if st.idle.is_zero() {
                 Some(st.inner.next().await)
             } else {
-                tokio::time::timeout(st.idle, st.inner.next()).await.ok()
+                // Any bytes reset the idle timer, but comment-only traffic
+                // may not outlast `data_deadline`.
+                let wait = st
+                    .idle
+                    .min(st.data_deadline.saturating_duration_since(Instant::now()));
+                tokio::time::timeout(wait, st.inner.next()).await.ok()
             };
+            if let Some(Some(Ok(bytes))) = &next
+                && st.scan.feed(bytes)
+            {
+                st.data_deadline = Instant::now() + st.idle * COMMENT_ONLY_IDLE_FACTOR;
+            }
             let Some(next) = next else {
                 st.done = true;
                 if let Some(tap) = st.tap.as_mut() {
@@ -860,6 +927,9 @@ struct StreamState {
     provider: String,
     model: String,
     idle: Duration,
+    scan: LineScan,
+    /// Cut the stream if no data line has arrived by then.
+    data_deadline: Instant,
     error_event: Bytes,
     idle_event: Bytes,
 }

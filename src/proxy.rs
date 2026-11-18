@@ -1233,6 +1233,9 @@ fn looks_too_large(body: &[u8]) -> bool {
         "too many tokens",
         "reduce the length",
         "request too large",
+        // Gemini rejects history whose tool calls came from another model
+        // (no thought_signature). Another route can serve the request.
+        "thought_signature",
     ];
     let head = body.get(..body.len().min(16 * 1024)).unwrap_or_default();
     let text = String::from_utf8_lossy(head).to_ascii_lowercase();

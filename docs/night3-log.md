@@ -268,3 +268,8 @@ All grep checks from card pass:
 - `grep -nE "fn cost\(&self, field: Option<&str>\)" src/proxy.rs` → line 1182
 
 ---
+## SL-06: Credit guard at 90% of credit_usd
+- **Files:** src/limiter.rs, src/select.rs, src/proxy.rs, tests/proxy.rs
+- **What:** `CREDIT_GUARD_FRACTION = 0.9`. A credit provider whose period spend is at or above 90% of `credit_usd` is skipped before any upstream call with skip reason `credit_exhausted`; a warn line and event are emitted once when the threshold is crossed. `paid_daily_cap_usd` handling is unchanged.
+- **Tests:** `credit_spend_reaching_90_percent_makes_provider_ineligible`, `credit_resets_on_the_reset_day` (reset day 31 falls on the last day of short months). Suite: 179 passed, clippy clean.
+- **Note:** implemented by an OpenCode session that stopped before committing; verified and committed by the supervisor. From SL-07 on, Mai asked the supervisor to finish the Sluice work directly (the OpenCode CLI was hanging on runs started with a custom session id).

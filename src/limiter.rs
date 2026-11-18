@@ -29,6 +29,9 @@ const WINDOW: Duration = Duration::from_secs(60);
 pub const HOURLY_BUCKETS: u64 = 24;
 /// Cooldowns at most this long are not worth persisting.
 pub const PERSIST_COOLDOWN_MIN: Duration = Duration::from_secs(60);
+/// Credit guard fraction: when spend reaches this fraction of credit_usd,
+/// the provider becomes ineligible until the next period reset.
+pub const CREDIT_GUARD_FRACTION: f64 = 0.9;
 
 /// Backoff after `step` earlier consecutive 429s: 15 s, 30 s, ... capped.
 pub fn backoff(step: u32) -> Duration {
@@ -342,6 +345,33 @@ impl State {
             .get(&ScopeKey::route(&provider.id, key, model))?
             .check(limits, estimate, day, day_free, now)
     }
+
+    /// Private helper to compute credit status for a provider.
+    fn credit_status(&self, provider: &Provider, now: Instant) -> Option<CreditStatus> {
+        let credit = provider.credit.as_ref()?;
+        let unix = self.unix(now);
+        let period_start =
+            crate::billing::month_start(unix, provider.month_reset_day, provider.reset_utc_hour);
+        let resets_at = crate::billing::next_month_start(
+            unix,
+            provider.month_reset_day,
+            provider.reset_utc_hour,
+        );
+        let spent = self
+            .credit
+            .get(&provider.id)
+            .filter(|cs| cs.period_start == period_start)
+            .map(|cs| cs.usd)
+            .unwrap_or(0.0);
+        let exhausted = spent >= credit.usd * CREDIT_GUARD_FRACTION;
+        Some(CreditStatus {
+            credit_usd: credit.usd,
+            spent_usd: spent,
+            period_start,
+            resets_at,
+            exhausted,
+        })
+    }
 }
 
 impl RouteView for State {
@@ -356,6 +386,15 @@ impl RouteView for State {
         let id = provider.id.as_str();
         if self.paused.contains(id) {
             return Some(Skip::Paused);
+        }
+        // Credit guard: skip if this credit provider's spend has reached the guard fraction.
+        if let Some(cs) = self.credit_status(provider, now)
+            && cs.exhausted
+        {
+            let until_secs = cs.resets_at.saturating_sub(self.unix(now)).max(1);
+            return Some(Skip::CreditExhausted {
+                until: now + Duration::from_secs(until_secs),
+            });
         }
         if self.disabled.contains(&(id.to_string(), key)) {
             return Some(Skip::KeyDisabled);
@@ -473,6 +512,16 @@ pub struct CooldownSnap {
 pub struct CreditSpend {
     pub period_start: u64,
     pub usd: f64,
+}
+
+/// Status of a credit provider's spending for the current period.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreditStatus {
+    pub credit_usd: f64,
+    pub spent_usd: f64,
+    pub period_start: u64,
+    pub resets_at: u64,
+    pub exhausted: bool,
 }
 
 /// A day counter for one bucket, for persistence.
@@ -622,6 +671,9 @@ impl Limiter {
     ///   per day for others, so it is applied only when exactly one of `rpm`
     ///   and `rpd` is configured (that one), and ignored when both or neither
     ///   are known.
+    ///
+    /// Returns `true` when this call moved a credit provider from not exhausted
+    /// to exhausted (crossed the 90% guard fraction).
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage(
         &self,
@@ -632,7 +684,7 @@ impl Limiter {
         hints: RemainingHints,
         now: Instant,
         reported_cost_usd: Option<f64>,
-    ) {
+    ) -> bool {
         let mut st = self.lock();
         let unix = st.unix(now);
         let day = day_index(unix, provider.reset_utc_hour);
@@ -673,19 +725,27 @@ impl Limiter {
             st.spend.usd += cost;
         }
 
-        // Credit providers: track per credit period
-        if provider.credit.is_some() {
+        // Credit providers: track per credit period and detect crossing
+        let mut credit_exhausted_now = false;
+        if let Some(credit) = &provider.credit {
             let start = crate::billing::month_start(
                 unix,
                 provider.month_reset_day,
                 provider.reset_utc_hour,
             );
             let cs = st.credit.entry(provider.id.clone()).or_default();
+            let was_exhausted = if cs.period_start == start {
+                cs.usd >= credit.usd * CREDIT_GUARD_FRACTION
+            } else {
+                false
+            };
             if cs.period_start != start {
                 cs.period_start = start;
                 cs.usd = 0.0;
             }
             cs.usd += cost;
+            let now_exhausted = cs.usd >= credit.usd * CREDIT_GUARD_FRACTION;
+            credit_exhausted_now = !was_exhausted && now_exhausted;
         }
 
         let limits = provider.limits.limits;
@@ -710,6 +770,7 @@ impl Limiter {
                 _ => {}
             }
         }
+        credit_exhausted_now
     }
 
     /// Paid spend for the current UTC day, in USD.
@@ -756,6 +817,12 @@ impl Limiter {
             .filter(|cs| cs.period_start == start)
             .map(|cs| cs.usd)
             .unwrap_or(0.0)
+    }
+
+    /// Full credit status for the current credit period, including whether
+    /// the guard fraction has been reached.
+    pub fn credit_status(&self, provider: &Provider, now: Instant) -> Option<CreditStatus> {
+        self.lock().credit_status(provider, now)
     }
 
     /// Tokens in and out per hour for `provider`, oldest first, covering the
@@ -1688,5 +1755,148 @@ out_per_mtok = 0.0
         // Same usage recorded in l2 would start fresh
         l2.record_usage(p, 0, "m", usage, RemainingHints::default(), now2, None);
         assert!((l2.credit_spent(p, now2) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn credit_spend_reaching_90_percent_makes_provider_ineligible() {
+        // credit_usd = 10, in_per_mtok = 1.0
+        // 8,990,000 input tokens = $8.99 (eligible), 10,000 more = $9.00 (exhausted)
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "http://p/v1"
+keys_env = "K"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+reset_utc_hour = 0
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 0.0
+"#;
+        let c = Config::from_toml_str(text, &|_| Some("key-aaaa-0001".to_string())).unwrap();
+        let p = &c.providers[0];
+        let unix = 1796030400; // 2026-11-30 12:00 UTC
+        let at = UNIX_EPOCH + Duration::from_secs(unix);
+        let l = Limiter::with_anchor(Instant::now(), at);
+        let now = Instant::now();
+
+        // 8,990,000 input tokens = $8.99 (below 90% = $9.00)
+        let usage1 = Usage {
+            input: 8_990_000,
+            output: 0,
+        };
+        let crossed1 = l.record_usage(p, 0, "m", usage1, RemainingHints::default(), now, None);
+        assert!(!crossed1, "should not be exhausted yet");
+        let skip = l.skip_reason(p, 0, "m", 0, now);
+        assert!(
+            skip.is_none(),
+            "provider should still be eligible: {:?}",
+            skip
+        );
+
+        // Another 10,000 input tokens = $0.01, total $9.00 (exactly 90%)
+        let usage2 = Usage {
+            input: 10_000,
+            output: 0,
+        };
+        let crossed2 = l.record_usage(p, 0, "m", usage2, RemainingHints::default(), now, None);
+        assert!(crossed2, "should be exhausted now");
+        let skip = l.skip_reason(p, 0, "m", 0, now);
+        assert!(matches!(skip, Some(Skip::CreditExhausted { .. })));
+        assert_eq!(skip.unwrap().name(), "credit_exhausted");
+    }
+
+    #[test]
+    fn credit_resets_on_the_reset_day() {
+        // Case 1: reset_day = 1, at 2026-11-30 23:00 UTC
+        let text1 = r#"
+[[provider]]
+id = "p"
+base_url = "http://p/v1"
+keys_env = "K"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+reset_utc_hour = 0
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 0.0
+"#;
+        let c1 = Config::from_toml_str(text1, &|_| Some("key-aaaa-0001".to_string())).unwrap();
+        let p1 = &c1.providers[0];
+        // 2026-11-30 23:00 UTC
+        let unix1 = 1796079600; // 2026-11-30 23:00:00 UTC
+        let at1 = UNIX_EPOCH + Duration::from_secs(unix1);
+        let l1 = Limiter::with_anchor(Instant::now(), at1);
+        let now1 = Instant::now();
+
+        // Exhaust the credit: 10M tokens = $10.00
+        let usage = Usage {
+            input: 10_000_000,
+            output: 0,
+        };
+        l1.record_usage(p1, 0, "m", usage, RemainingHints::default(), now1, None);
+        let skip = l1.skip_reason(p1, 0, "m", 0, now1);
+        // until should be now + 3600s (1 hour until 2026-12-01 00:00 UTC)
+        if let Some(Skip::CreditExhausted { until }) = skip {
+            let diff = until.saturating_duration_since(now1).as_secs();
+            assert!((3500..=3700).contains(&diff), "until diff: {}", diff);
+        } else {
+            panic!("expected CreditExhausted skip, got {:?}", skip);
+        }
+
+        // At 2026-12-01 00:00 UTC, the provider should be eligible again (new period, 0 spend)
+        let unix2 = 1796083200; // 2026-12-01 00:00:00 UTC
+        let at2 = UNIX_EPOCH + Duration::from_secs(unix2);
+        let l2 = Limiter::with_anchor(Instant::now(), at2);
+        let now2 = Instant::now();
+        // Don't record usage - just check eligibility with 0 spend
+        let skip = l2.skip_reason(p1, 0, "m", 0, now2);
+        assert!(
+            skip.is_none(),
+            "provider should be eligible after reset: {:?}",
+            skip
+        );
+
+        // Case 2: reset_day = 31 at 2026-11-29, period resets at 2026-11-30 00:00 UTC
+        let text2 = r#"
+[[provider]]
+id = "p"
+base_url = "http://p/v1"
+keys_env = "K"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 31
+reset_utc_hour = 0
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 0.0
+"#;
+        let c2 = Config::from_toml_str(text2, &|_| Some("key-aaaa-0001".to_string())).unwrap();
+        let p2 = &c2.providers[0];
+        // 2026-11-29 12:00 UTC
+        let unix3 = 1795953600; // 2026-11-29 12:00:00 UTC
+        let at3 = UNIX_EPOCH + Duration::from_secs(unix3);
+        let l3 = Limiter::with_anchor(Instant::now(), at3);
+        let now3 = Instant::now();
+
+        // Exhaust the credit
+        l3.record_usage(p2, 0, "m", usage, RemainingHints::default(), now3, None);
+        let skip = l3.skip_reason(p2, 0, "m", 0, now3);
+        assert!(matches!(skip, Some(Skip::CreditExhausted { .. })));
+
+        // At 2026-11-30 00:00 UTC, the provider should be eligible (November has 30 days)
+        let unix4 = 1795996800; // 2026-11-30 00:00:00 UTC
+        let at4 = UNIX_EPOCH + Duration::from_secs(unix4);
+        let l4 = Limiter::with_anchor(Instant::now(), at4);
+        let now4 = Instant::now();
+        // Don't record usage - just check eligibility with 0 spend
+        let skip = l4.skip_reason(p2, 0, "m", 0, now4);
+        assert!(
+            skip.is_none(),
+            "provider should be eligible after reset: {:?}",
+            skip
+        );
     }
 }

@@ -40,6 +40,11 @@ pub enum Skip {
     },
     /// The request is private and the provider trains on input.
     Privacy,
+    /// A credit provider's spend has reached the guard fraction (90%) of its
+    /// credit limit. `until` is when the credit period resets.
+    CreditExhausted {
+        until: Instant,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +72,7 @@ impl Skip {
                 QuotaKind::Tpd => "quota_tpd",
             },
             Self::Privacy => "private_excluded",
+            Self::CreditExhausted { .. } => "credit_exhausted",
         }
     }
 
@@ -75,6 +81,7 @@ impl Skip {
         match self {
             Self::BreakerOpen { until } | Self::Cooldown { until } => Some(*until),
             Self::Quota { until, .. } => *until,
+            Self::CreditExhausted { until } => Some(*until),
             _ => None,
         }
     }

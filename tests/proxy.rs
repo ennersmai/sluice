@@ -2139,3 +2139,103 @@ fn usage_reply_with_cost(cost: f64) -> Reply {
         ),
     )
 }
+
+// ---------------------------------------------------------------------------
+// SL-06: credit guard at 90%
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credit_exhausted_provider_is_skipped_without_upstream_call() {
+    // beta has credit_usd = 0.01, price in = 1000/1M
+    // usage_reply() gives 10 input tokens = $0.01
+    let beta = Mock::start(usage_reply()).await;
+    // Custom config with only beta in the pool
+    let text = format!(
+        r#"
+[[provider]]
+id = "beta"
+base_url = "{}"
+keys_env = "BETA_KEYS"
+billing = "credit"
+credit_usd = 0.01
+credit_reset_day = 1
+[provider.prices."fallback-model"]
+in_per_mtok = 1000.0
+out_per_mtok = 0.0
+
+[[pool]]
+name = "coder"
+routes = ["beta/fallback-model"]
+"#,
+        beta.base_url()
+    );
+    let env: HashMap<&str, &str> = [("BETA_KEYS", BETA_KEY)].into();
+    let config = Config::from_toml_str(&text, &|k| env.get(k).map(|v| v.to_string())).unwrap();
+    let (router, _state) = start_router_state(config, false).await;
+
+    // First request: costs $0.01, exactly hits the 90% guard ($0.009)
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(beta.calls().len(), 1);
+
+    // Second request: should be skipped with credit_exhausted, no upstream call
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "credit_exhausted");
+    assert!(
+        v["error"]["routes"][0]["retry_after_secs"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(beta.calls().len(), 1, "no upstream call for second request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credit_exhausted_survives_restart() {
+    // Same config as above plus state_file
+    let file = temp_state_file("sl06-restart");
+    let beta = Mock::start(usage_reply()).await;
+    let top = format!("state_file = '{file}'");
+    let text = format!(
+        r#"
+{top}
+[[provider]]
+id = "beta"
+base_url = "{}"
+keys_env = "BETA_KEYS"
+billing = "credit"
+credit_usd = 0.01
+credit_reset_day = 1
+[provider.prices."fallback-model"]
+in_per_mtok = 1000.0
+out_per_mtok = 0.0
+
+[[pool]]
+name = "coder"
+routes = ["beta/fallback-model"]
+"#,
+        beta.base_url()
+    );
+    let env: HashMap<&str, &str> = [("BETA_KEYS", BETA_KEY)].into();
+    let config = Config::from_toml_str(&text, &|k| env.get(k).map(|v| v.to_string())).unwrap();
+
+    // First run: exhaust the credit
+    let (router, state) = start_router_state(config.clone(), false).await;
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    sluice::state::save(&state).unwrap();
+
+    // Restart: credit_exhausted should persist
+    let (router, _state) = start_router_state(config, true).await;
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "credit_exhausted");
+    assert_eq!(beta.calls().len(), 1, "no upstream call after restart");
+
+    let _ = std::fs::remove_file(&file);
+}

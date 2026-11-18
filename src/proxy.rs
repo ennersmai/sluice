@@ -1002,7 +1002,7 @@ impl Drop for Settle {
             output: self.out_bytes / 4,
         });
         if let Some(provider) = self.state.config.provider(&self.provider) {
-            self.state.limiter.record_usage(
+            let crossed = self.state.limiter.record_usage(
                 provider,
                 self.key_idx,
                 &self.model,
@@ -1011,6 +1011,27 @@ impl Drop for Settle {
                 Instant::now(),
                 self.reported_cost,
             );
+            if crossed {
+                let now = Instant::now();
+                if let Some(status) = self.state.limiter.credit_status(provider, now) {
+                    let reset_time = crate::events::format_utc(status.resets_at);
+                    crate::elog!(
+                        "warn: credit guard reached provider={} spent=${:.4} of ${:.2} ({:.0}%), ineligible until {}",
+                        provider.id,
+                        status.spent_usd,
+                        status.credit_usd,
+                        (status.spent_usd / status.credit_usd) * 100.0,
+                        reset_time
+                    );
+                    self.state.events.route_state(
+                        &provider.id,
+                        None,
+                        None,
+                        "credit_exhausted",
+                        None,
+                    );
+                }
+            }
         }
         let error = if self.failed {
             Some("stream_interrupted")

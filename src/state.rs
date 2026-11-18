@@ -16,7 +16,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::limiter::{CooldownSnap, DaySnap, ScopeKey, Snapshot, Spend};
+use crate::limiter::{CooldownSnap, CreditSpend, DaySnap, ScopeKey, Snapshot, Spend};
 
 const VERSION: u32 = 1;
 
@@ -30,6 +30,12 @@ struct File {
     #[serde(default)]
     ceilings: Vec<Ceiling>,
     spend: PaidSpend,
+    /// Per-provider UTC day spend.
+    #[serde(default)]
+    provider_spend: Vec<ProviderSpend>,
+    /// Per-provider credit period spend.
+    #[serde(default)]
+    credit: Vec<CreditPeriod>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,6 +81,20 @@ struct Cooldown {
 struct PaidSpend {
     /// UTC day number.
     day: u64,
+    usd: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProviderSpend {
+    provider: String,
+    day: u64,
+    usd: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CreditPeriod {
+    provider: String,
+    period_start_unix: u64,
     usd: f64,
 }
 
@@ -144,6 +164,24 @@ impl From<Snapshot> for File {
                 day: s.spend.day,
                 usd: s.spend.usd,
             },
+            provider_spend: s
+                .provider_spend
+                .into_iter()
+                .map(|(provider, spend)| ProviderSpend {
+                    provider,
+                    day: spend.day,
+                    usd: spend.usd,
+                })
+                .collect(),
+            credit: s
+                .credit
+                .into_iter()
+                .map(|(provider, cs)| CreditPeriod {
+                    provider,
+                    period_start_unix: cs.period_start,
+                    usd: cs.usd,
+                })
+                .collect(),
         }
     }
 }
@@ -188,6 +226,40 @@ impl From<File> for Snapshot {
                     0.0
                 },
             },
+            provider_spend: f
+                .provider_spend
+                .into_iter()
+                .map(|ps| {
+                    (
+                        ps.provider,
+                        Spend {
+                            day: ps.day,
+                            usd: if ps.usd.is_finite() {
+                                ps.usd.max(0.0)
+                            } else {
+                                0.0
+                            },
+                        },
+                    )
+                })
+                .collect(),
+            credit: f
+                .credit
+                .into_iter()
+                .map(|cp| {
+                    (
+                        cp.provider,
+                        CreditSpend {
+                            period_start: cp.period_start_unix,
+                            usd: if cp.usd.is_finite() {
+                                cp.usd.max(0.0)
+                            } else {
+                                0.0
+                            },
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -241,6 +313,11 @@ pub fn load(state: &AppState) {
             state.limiter.restore(
                 f.into(),
                 &|id| config.provider(id).map(|p| p.reset_utc_hour),
+                &|id, unix| {
+                    config.provider(id).map(|p| {
+                        crate::billing::month_start(unix, p.month_reset_day, p.reset_utc_hour)
+                    })
+                },
                 &|id, model| config.provider(id).is_some_and(|p| p.allows_model(model)),
                 Instant::now(),
             );
@@ -301,7 +378,7 @@ mod tests {
             output: 2,
         };
         a.limiter
-            .record_usage(p, 0, "m", usage, Default::default(), now);
+            .record_usage(p, 0, "m", usage, Default::default(), now, None);
         a.limiter.record_ceiling("p", "m", 5000);
         assert_eq!(a.limiter.snapshot(now).ceilings.len(), 1);
         save(&a).unwrap();
@@ -315,6 +392,35 @@ mod tests {
             b.limiter.snapshot(now).ceilings,
             a.limiter.snapshot(now).ceilings
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn credit_spend_survives_restart() {
+        let path = temp_path("credit_restart");
+        let text = format!(
+            "state_file = '{}'\n[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\nbilling = \"credit\"\ncredit_usd = 10.0\ncredit_reset_day = 1\n[provider.prices.\"m\"]\nin_per_mtok = 1.0\nout_per_mtok = 0.0\n",
+            path.display()
+        );
+        let config = Config::from_toml_str(&text, &|_| Some("k".into())).unwrap();
+        let a = AppState::new(config).unwrap();
+        let now = Instant::now();
+        let p = a.config.provider("p").unwrap();
+        // 2,000,000 input tokens at $1.0/Mtok = $2.00
+        let usage = crate::limiter::Usage {
+            input: 2_000_000,
+            output: 0,
+        };
+        a.limiter
+            .record_usage(p, 0, "m", usage, Default::default(), now, None);
+        assert!((a.limiter.credit_spent(p, now) - 2.0).abs() < 1e-9);
+        assert!((a.limiter.provider_spend_today("p", now) - 2.0).abs() < 1e-9);
+        save(&a).unwrap();
+
+        let b = state_with_file(&path);
+        load(&b);
+        assert!((b.limiter.credit_spent(p, now) - 2.0).abs() < 1e-9);
+        assert!((b.limiter.provider_spend_today("p", now) - 2.0).abs() < 1e-9);
         let _ = fs::remove_file(&path);
     }
 }

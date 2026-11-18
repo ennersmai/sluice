@@ -1000,6 +1000,7 @@ impl Drop for Settle {
                 usage,
                 self.hints,
                 Instant::now(),
+                None,
             );
         }
         let error = if self.failed {

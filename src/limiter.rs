@@ -258,6 +258,10 @@ pub struct State {
     /// Per provider: hour number -> (tokens in, tokens out).
     hourly: HashMap<String, BTreeMap<u64, (u64, u64)>>,
     spend: Spend,
+    /// Per-provider UTC day spend.
+    provider_spend: HashMap<String, Spend>,
+    /// Per-provider credit period spend.
+    credit: HashMap<String, CreditSpend>,
 }
 
 impl Default for State {
@@ -278,6 +282,8 @@ impl Default for State {
             buckets: HashMap::new(),
             hourly: HashMap::new(),
             spend: Spend::default(),
+            provider_spend: HashMap::new(),
+            credit: HashMap::new(),
         }
     }
 }
@@ -462,6 +468,13 @@ pub struct CooldownSnap {
     pub step: u32,
 }
 
+/// Credit spend for one provider, per credit period.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CreditSpend {
+    pub period_start: u64,
+    pub usd: f64,
+}
+
 /// A day counter for one bucket, for persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaySnap {
@@ -481,6 +494,10 @@ pub struct Snapshot {
     /// (provider, model, ceiling in estimated tokens)
     pub ceilings: Vec<(String, String, u64)>,
     pub spend: Spend,
+    /// Per-provider UTC day spend.
+    pub provider_spend: Vec<(String, Spend)>,
+    /// Per-provider credit period spend.
+    pub credit: Vec<(String, CreditSpend)>,
 }
 
 /// State of one provider, with deadlines as `Instant`s.
@@ -515,6 +532,18 @@ pub struct Limiter {
 impl Limiter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a limiter whose wall clock is `wall` at `at`, so tests can pin dates.
+    /// Test-oriented.
+    pub fn with_anchor(at: Instant, wall: SystemTime) -> Self {
+        let inner = State {
+            anchor: (at, wall),
+            ..State::default()
+        };
+        Self {
+            inner: Mutex::new(inner),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -582,7 +611,7 @@ impl Limiter {
     }
 
     /// Record tokens used by a finished (or cancelled) request: bucket
-    /// counters, the provider's hourly history and, for paid providers, spend.
+    /// counters, the provider's hourly history and spend tracking.
     /// `hints` (provider-reported remaining allowance) then overwrite the
     /// provider-scope counters where they map cleanly:
     ///
@@ -593,6 +622,7 @@ impl Limiter {
     ///   per day for others, so it is applied only when exactly one of `rpm`
     ///   and `rpd` is configured (that one), and ignored when both or neither
     ///   are known.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_usage(
         &self,
         provider: &Provider,
@@ -601,6 +631,7 @@ impl Limiter {
         usage: Usage,
         hints: RemainingHints,
         now: Instant,
+        reported_cost_usd: Option<f64>,
     ) {
         let mut st = self.lock();
         let unix = st.unix(now);
@@ -618,21 +649,45 @@ impl Limiter {
         slot.0 = slot.0.saturating_add(usage.input);
         slot.1 = slot.1.saturating_add(usage.output);
         h.retain(|k, _| *k + HOURLY_BUCKETS > hour);
-        if provider.paid
-            && let Some(price) = provider.prices.get(model)
-        {
-            let usd = (usage.input as f64 * price.in_per_mtok
-                + usage.output as f64 * price.out_per_mtok)
-                / 1_000_000.0;
-            let utc_day = unix / 86_400;
+
+        // Compute cost once
+        let cost = crate::billing::request_cost_usd(provider, model, usage, reported_cost_usd);
+
+        // Per-provider UTC day spend for every billing type
+        let utc_day = unix / 86_400;
+        let ps = st.provider_spend.entry(provider.id.clone()).or_default();
+        if ps.day != utc_day {
+            ps.day = utc_day;
+            ps.usd = 0.0;
+        }
+        ps.usd += cost;
+
+        // Paid providers: also track in global spend (for paid_daily_cap_usd)
+        if provider.paid {
             if st.spend.day != utc_day {
                 st.spend = Spend {
                     day: utc_day,
                     usd: 0.0,
                 };
             }
-            st.spend.usd += usd;
+            st.spend.usd += cost;
         }
+
+        // Credit providers: track per credit period
+        if provider.credit.is_some() {
+            let start = crate::billing::month_start(
+                unix,
+                provider.month_reset_day,
+                provider.reset_utc_hour,
+            );
+            let cs = st.credit.entry(provider.id.clone()).or_default();
+            if cs.period_start != start {
+                cs.period_start = start;
+                cs.usd = 0.0;
+            }
+            cs.usd += cost;
+        }
+
         let limits = provider.limits.limits;
         let b = st
             .buckets
@@ -665,6 +720,42 @@ impl Limiter {
         } else {
             0.0
         }
+    }
+
+    /// Per-provider spend for the current UTC day, in USD.
+    pub fn provider_spend_today(&self, provider: &str, now: Instant) -> f64 {
+        let st = self.lock();
+        let utc_day = st.unix(now) / 86_400;
+        st.provider_spend
+            .get(provider)
+            .filter(|ps| ps.day == utc_day)
+            .map(|ps| ps.usd)
+            .unwrap_or(0.0)
+    }
+
+    /// Total estimated spend across all providers for the current UTC day, in USD.
+    pub fn total_spend_today(&self, now: Instant) -> f64 {
+        let st = self.lock();
+        let utc_day = st.unix(now) / 86_400;
+        st.provider_spend
+            .values()
+            .filter(|ps| ps.day == utc_day)
+            .map(|ps| ps.usd)
+            .sum()
+    }
+
+    /// Credit spend for the current credit period, in USD.
+    /// Returns 0.0 when the stored period is not the current one.
+    pub fn credit_spent(&self, provider: &Provider, now: Instant) -> f64 {
+        let st = self.lock();
+        let unix = st.unix(now);
+        let start =
+            crate::billing::month_start(unix, provider.month_reset_day, provider.reset_utc_hour);
+        st.credit
+            .get(&provider.id)
+            .filter(|cs| cs.period_start == start)
+            .map(|cs| cs.usd)
+            .unwrap_or(0.0)
     }
 
     /// Tokens in and out per hour for `provider`, oldest first, covering the
@@ -952,16 +1043,25 @@ impl Limiter {
                 .map(|((p, m), c)| (p.clone(), m.clone(), *c))
                 .collect(),
             spend: st.spend,
+            provider_spend: st
+                .provider_spend
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            credit: st.credit.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         }
     }
 
     /// Load a snapshot, discarding anything past its reset or expiry.
     /// `reset_hour` gives each provider's day boundary; scopes of unknown
     /// providers are dropped.
+    /// `month_start` maps (provider id, unix) to the current monthly period start,
+    /// `None` for an unknown provider. Used to restore credit spend.
     pub fn restore(
         &self,
         snap: Snapshot,
         reset_hour: &dyn Fn(&str) -> Option<u8>,
+        month_start: &dyn Fn(&str, u64) -> Option<u64>,
         model_known: &dyn Fn(&str, &str) -> bool,
         now: Instant,
     ) {
@@ -1006,6 +1106,31 @@ impl Limiter {
         }
         if snap.spend.day == unix / 86_400 {
             st.spend = snap.spend;
+        }
+        // provider_spend: keep entries whose provider is known and whose day is today
+        for (p, ps) in snap.provider_spend {
+            if reset_hour(&p).is_none() {
+                continue;
+            }
+            if ps.day != unix / 86_400 {
+                continue;
+            }
+            let entry = st.provider_spend.entry(p).or_default();
+            entry.day = ps.day;
+            entry.usd = entry.usd.max(ps.usd);
+        }
+        // credit: keep entries only when month_start(id, unix) == Some(entry.period_start)
+        // Merge as usd = max(existing, snapshot), which SL-07 relies on.
+        for (p, cs) in snap.credit {
+            let Some(current_start) = month_start(&p, unix) else {
+                continue;
+            };
+            if cs.period_start != current_start {
+                continue;
+            }
+            let entry = st.credit.entry(p).or_default();
+            entry.period_start = cs.period_start;
+            entry.usd = entry.usd.max(cs.usd);
         }
     }
 }
@@ -1291,7 +1416,7 @@ mod tests {
             input: 500,
             output: 100,
         };
-        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now);
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
         assert!(skip(&l, &c, 0, "m", 400, now).is_none());
         let s = skip(&l, &c, 0, "m", 401, now);
         assert_eq!(
@@ -1354,7 +1479,7 @@ mod tests {
             input: 1,
             output: 1,
         };
-        l.record_usage(p, 0, "m", usage, hints, now);
+        l.record_usage(p, 0, "m", usage, hints, now, None);
         // Tokens used are now 700, so 301 more does not fit.
         assert_eq!(skip(&l, &c, 0, "m", 301, now).unwrap().name(), "quota_tpm");
         assert!(skip(&l, &c, 0, "m", 300, now).is_none());
@@ -1372,7 +1497,7 @@ mod tests {
             input: 7,
             output: 3,
         };
-        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now);
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
         let long = Some(Duration::from_secs(300));
         l.record_rate_limit(ScopeKey::route("p", 0, "m"), long, now);
         let short = Some(Duration::from_secs(30));
@@ -1382,7 +1507,9 @@ mod tests {
 
         let l2 = Limiter::new();
         let reset = |id: &str| (id == "p").then_some(0u8);
-        l2.restore(snap, &reset, &|_, _| true, now);
+        let month_start =
+            |id: &str, unix: u64| (id == "p").then(|| crate::billing::month_start(unix, 1, 0));
+        l2.restore(snap, &reset, &month_start, &|_, _| true, now);
         assert_eq!(hourly_io(&l2, now), [(7, 3)]);
         assert_eq!(skip(&l2, &c, 0, "m", 0, now).unwrap().name(), "cooldown");
         assert!(skip(&l2, &c, 1, "m", 0, now).is_none());
@@ -1420,13 +1547,14 @@ mod tests {
                 day: unix / 86_400 - 1,
                 usd: 5.0,
             },
+            provider_spend: vec![],
+            credit: vec![],
         };
-        l.restore(
-            snap,
-            &|id| (id == "p").then_some(0u8),
-            &|_, m| m != "gone",
-            now,
-        );
+        let reset = |id: &str| (id == "p").then_some(0u8);
+        let month_start =
+            |id: &str, unix: u64| (id == "p").then(|| crate::billing::month_start(unix, 1, 0));
+        let model_known = |id: &str, model: &str| (id == "p") && (model != "gone");
+        l.restore(snap, &reset, &month_start, &model_known, now);
         assert_eq!(l.snapshot(now), Snapshot::default());
         assert_eq!(l.spend_today(now), 0.0);
     }
@@ -1485,5 +1613,80 @@ mod tests {
         assert_eq!(secs("999999999"), Some(86_400));
         assert_eq!(secs("soon"), None);
         assert_eq!(secs(""), None);
+    }
+
+    #[test]
+    fn spend_is_tracked_for_every_provider_and_free_without_prices_costs_zero() {
+        // Free provider with no prices: usage adds 0.0 to spend but still counts requests/day
+        let c = cfg("[provider.limits]\nrpd = 100");
+        let p = &c.providers[0];
+        let l = Limiter::new();
+        let now = Instant::now();
+        let usage = Usage {
+            input: 1000,
+            output: 1000,
+        };
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
+        assert_eq!(l.provider_spend_today("p", now), 0.0);
+        assert_eq!(l.total_spend_today(now), 0.0);
+        // Request/day counters still work
+        let s = skip(&l, &c, 0, "m", 0, now);
+        assert!(s.is_none(), "day counter should not block yet");
+
+        // Free provider with prices: adds positive amount
+        let c2 = cfg(
+            "[provider.limits]\nrpd = 100\n[provider.prices.\"m\"]\nin_per_mtok = 1.0\nout_per_mtok = 2.0",
+        );
+        let p2 = &c2.providers[0];
+        let l2 = Limiter::new();
+        l2.record_usage(p2, 0, "m", usage, RemainingHints::default(), now, None);
+        // (1000 * 1.0 + 1000 * 2.0) / 1e6 = 0.003
+        assert!((l2.provider_spend_today("p", now) - 0.003).abs() < 1e-9);
+        assert!((l2.total_spend_today(now) - 0.003).abs() < 1e-9);
+    }
+
+    #[test]
+    fn credit_spend_accumulates_per_period_and_rolls_over() {
+        // reset_day = 1, so period starts at 1st of month 00:00 UTC
+        // with_anchor at 2026-11-30 12:00 UTC
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "http://p/v1"
+keys_env = "K"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+reset_utc_hour = 0
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 0.0
+"#;
+        let c = Config::from_toml_str(text, &|_| Some("key-aaaa-0001,key-aaaa-0002".to_string()))
+            .unwrap();
+        let p = &c.providers[0];
+        // 2026-11-30 12:00 UTC
+        let unix = 1796030400; // 2026-11-30 12:00:00 UTC
+        let at = UNIX_EPOCH + Duration::from_secs(unix);
+        let l = Limiter::with_anchor(Instant::now(), at);
+        let now = Instant::now();
+
+        // Record twice, each 1M input tokens = $1.00
+        let usage = Usage {
+            input: 1_000_000,
+            output: 0,
+        };
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
+        assert!((l.credit_spent(p, now) - 2.0).abs() < 1e-9);
+
+        // At 2026-12-01 00:00 UTC, credit_spent should be 0 (new period)
+        let unix2 = 1796160000; // 2026-12-01 00:00:00 UTC
+        let at2 = UNIX_EPOCH + Duration::from_secs(unix2);
+        let l2 = Limiter::with_anchor(Instant::now(), at2);
+        let now2 = Instant::now();
+        // Same usage recorded in l2 would start fresh
+        l2.record_usage(p, 0, "m", usage, RemainingHints::default(), now2, None);
+        assert!((l2.credit_spent(p, now2) - 1.0).abs() < 1e-9);
     }
 }

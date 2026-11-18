@@ -194,3 +194,42 @@ All grep checks from card pass:
 - `grep -nE "pub tpmo: Option<u64>" src/config.rs` → line 235
 
 ---
+
+## SL-04: Track estimated spend for every provider (completed 2026-11-19)
+
+### Files changed
+- src/billing.rs: Added `pub fn request_cost_usd(provider: &Provider, model: &str, usage: Usage, reported_usd: Option<f64>) -> f64` - computes cost from reported USD or price fallback
+- src/limiter.rs: 
+  - Added `CreditSpend` struct with `period_start` and `usd` fields
+  - Added `provider_spend: HashMap<String, Spend>` and `credit: HashMap<String, CreditSpend>` to `State`
+  - Added `Limiter::with_anchor(at: Instant, wall: SystemTime) -> Self` for test date pinning
+  - Modified `record_usage` to accept `reported_cost_usd: Option<f64>` parameter and track spend for all billing types
+  - Added `provider_spend_today(provider: &str, now: Instant) -> f64`
+  - Added `total_spend_today(now: Instant) -> f64`
+  - Added `credit_spent(provider: &Provider, now: Instant) -> f64`
+  - Updated `Snapshot` with `provider_spend` and `credit` fields
+  - Updated `snapshot()` and `restore()` to persist/load new fields with proper rollover logic
+- src/state.rs:
+  - Added `ProviderSpend` and `CreditPeriod` structs to `File`
+  - Added `provider_spend` and `credit` fields to `File` with serde defaults
+  - Updated `From<Snapshot> for File` and `From<File> for Snapshot` conversions with USD sanitization
+  - Updated `load()` to pass `month_start` closure to `restore()`
+- src/proxy.rs: Updated `Settle::drop` to pass `None` as `reported_cost_usd` (SL-05 will wire the real value)
+
+### Tests added (3 new tests)
+- `limiter.rs::spend_is_tracked_for_every_provider_and_free_without_prices_costs_zero`: free provider with no prices adds 0.0 to spend but counts requests/day; free provider with prices adds positive amount; `total_spend_today` is sum
+- `limiter.rs::credit_spend_accumulates_per_period_and_rolls_over`: with `with_anchor` at 2026-11-30 12:00 UTC and reset day 1, records twice and checks sum; at 2026-12-01 00:00 `credit_spent` is 0
+- `state.rs::credit_spend_survives_restart`: credit provider (prices in=1.0) records 2M input tokens ($2.00); save, fresh AppState load, `credit_spent` and `provider_spend_today` both 2.0
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 116 unit tests + 5 main tests + 1 bench + 2 dashboard + 4 health + 46 proxy = 174 tests PASS
+
+### Verification
+All grep checks from card pass:
+- `grep -nE "pub fn (provider_spend_today|total_spend_today|credit_spent|with_anchor)" src/limiter.rs` → 4 lines (539, 726, 737, 749)
+- `grep -nE "pub fn request_cost_usd" src/billing.rs` → line 109
+- `grep -nE "provider\.prices\.get\(model\)" src/limiter.rs` → no matches (replaced with `provider.price_for(model)`)
+
+---

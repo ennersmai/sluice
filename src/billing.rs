@@ -102,6 +102,30 @@ pub fn next_month_start(unix: u64, reset_day: u8, reset_hour: u8) -> u64 {
     boundary(ny, nm, reset_day, reset_hour)
 }
 
+/// Compute the estimated cost of a request in USD.
+/// If `reported_usd` is finite and >= 0, use it.
+/// Otherwise use `provider.price_for(model)` to compute `(input * in_per_mtok + output * out_per_mtok) / 1e6`.
+/// With no prices at all (free providers only, since credit providers always have prices after SL-03) the cost is `0.0`.
+pub fn request_cost_usd(
+    provider: &crate::config::Provider,
+    model: &str,
+    usage: crate::limiter::Usage,
+    reported_usd: Option<f64>,
+) -> f64 {
+    if let Some(c) = reported_usd
+        && c.is_finite()
+        && c >= 0.0
+    {
+        return c;
+    }
+    if let Some(price) = provider.price_for(model) {
+        (usage.input as f64 * price.in_per_mtok + usage.output as f64 * price.out_per_mtok)
+            / 1_000_000.0
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

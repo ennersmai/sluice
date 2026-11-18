@@ -136,8 +136,15 @@ enum Class {
     /// This request is too big for the route (pool only): fail over with
     /// no cooldown and no breaker count.
     TooLarge,
+    /// HTTP 5xx: counts toward the route's breaker.
     ServerError,
+    /// Connect error, timeout or broken body: counts toward the provider's
+    /// breaker.
+    Unreachable,
+    /// 401 or 402: the key is disabled until restart.
     KeyRejected,
+    /// 403: this (provider, model) is unavailable until restart.
+    Forbidden,
     Missing,
 }
 
@@ -147,7 +154,8 @@ fn classify(status: StatusCode, is_pool: bool) -> Class {
         429 => Class::RateLimited,
         413 if is_pool => Class::TooLarge,
         500 | 502 | 503 | 504 => Class::ServerError,
-        401..=403 => Class::KeyRejected,
+        401 | 402 => Class::KeyRejected,
+        403 => Class::Forbidden,
         404 if is_pool => Class::Missing,
         _ => Class::Passthrough,
     }
@@ -321,12 +329,12 @@ async fn forward(
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
                 track.attempt(provider, entry.model, key, "unreachable", attempt_start);
-                apply_failure(state, entry, Class::ServerError, None, "unreachable");
+                apply_failure(state, entry, Class::Unreachable, None, "unreachable");
                 continue;
             }
             Err(_) => {
                 track.attempt(provider, entry.model, key, "timeout", attempt_start);
-                apply_failure(state, entry, Class::ServerError, None, "timeout");
+                apply_failure(state, entry, Class::Unreachable, None, "timeout");
                 continue;
             }
         };
@@ -402,7 +410,7 @@ async fn forward(
         let scope = limiter::scope_key(provider, entry.key_idx, entry.model);
         let body = if wants_stream || is_event_stream {
             let tap = if class == Class::Success {
-                state.limiter.record_success(&scope);
+                state.limiter.record_success(&scope, entry.model);
                 track.attempt(provider, entry.model, key, "ok", attempt_start);
                 Some(Tap::new(
                     Settle::new(state, entry, prompt_estimate, hints, &track, status),
@@ -425,7 +433,7 @@ async fn forward(
             match upstream.bytes().await {
                 Ok(bytes) => {
                     if class == Class::Success {
-                        state.limiter.record_success(&scope);
+                        state.limiter.record_success(&scope, entry.model);
                         track.attempt(provider, entry.model, key, "ok", attempt_start);
                         track.first_byte(headers_elapsed);
                         let mut settle =
@@ -451,7 +459,7 @@ async fn forward(
                 Err(_) if class == Class::Success => {
                     // Nothing has reached the client yet, so this can fail over.
                     track.attempt(provider, entry.model, key, "body_error", attempt_start);
-                    apply_failure(state, entry, Class::ServerError, None, "body_error");
+                    apply_failure(state, entry, Class::Unreachable, None, "body_error");
                     continue;
                 }
                 Err(_) => {
@@ -548,7 +556,12 @@ fn apply_failure(
     let events = &state.events;
     if matches!(
         class,
-        Class::RateLimited | Class::ServerError | Class::KeyRejected | Class::Missing
+        Class::RateLimited
+            | Class::ServerError
+            | Class::Unreachable
+            | Class::KeyRejected
+            | Class::Forbidden
+            | Class::Missing
     ) {
         events.note_error(provider, Some(model), detail);
     }
@@ -563,6 +576,21 @@ fn apply_failure(
             events.route_state(provider, Some(model), Some(key), "cooldown", Some(len));
         }
         Class::ServerError => {
+            if state.limiter.record_route_failure(provider, model, now) {
+                crate::elog!(
+                    "warn: circuit breaker open provider={provider} model={model} for {}s (last failure: {detail})",
+                    limiter::BREAKER_OPEN.as_secs()
+                );
+                events.route_state(
+                    provider,
+                    Some(model),
+                    None,
+                    "breaker_open",
+                    Some(limiter::BREAKER_OPEN),
+                );
+            }
+        }
+        Class::Unreachable => {
             if state.limiter.record_server_failure(provider, now) {
                 crate::elog!(
                     "warn: circuit breaker open provider={provider} for {}s (last failure: {detail})",
@@ -583,6 +611,14 @@ fn apply_failure(
                     "error: key disabled until restart provider={provider} key={key} (upstream {detail})"
                 );
                 events.route_state(provider, None, Some(key), "key_disabled", None);
+            }
+        }
+        Class::Forbidden => {
+            if state.limiter.mark_unavailable(provider, model) {
+                crate::elog!(
+                    "warn: route unavailable until restart provider={provider} model={model} (upstream {detail})"
+                );
+                events.route_state(provider, Some(model), None, "unavailable", None);
             }
         }
         Class::Missing => {
@@ -1184,23 +1220,26 @@ fn upstream_url(base_url: &str) -> String {
 }
 
 /// Headers sent upstream: the provider key replaces whatever the client sent
-/// (the client's own key never reaches a provider), plus `content-type` and
+/// (the client's own key never reaches a provider; a keyless provider gets no
+/// `Authorization` at all), plus `content-type` and
 /// the client's `accept`. Nothing else from the client is forwarded.
 fn upstream_request_headers(
     key: &ApiKey,
     provider_id: &str,
     client_headers: &HeaderMap,
 ) -> Result<HeaderMap, ApiError> {
-    let mut auth = HeaderValue::from_str(&format!("Bearer {}", key.expose())).map_err(|_| {
-        internal(format!(
-            "API key for provider \"{}\" contains characters not allowed in an HTTP header",
-            provider_id
-        ))
-    })?;
-    auth.set_sensitive(true);
-
     let mut headers = HeaderMap::new();
-    headers.insert(header::AUTHORIZATION, auth);
+    if !key.is_anonymous() {
+        let mut auth =
+            HeaderValue::from_str(&format!("Bearer {}", key.expose())).map_err(|_| {
+                internal(format!(
+                    "API key for provider \"{}\" contains characters not allowed in an HTTP header",
+                    provider_id
+                ))
+            })?;
+        auth.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth);
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),

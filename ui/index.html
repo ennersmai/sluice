@@ -16,7 +16,7 @@
 html{color-scheme:dark}
 body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
 .st-ok{--c:var(--ok)}.st-cooling{--c:var(--cooling)}.st-breaker_open,.st-key_disabled{--c:var(--bad)}
-.st-paused{--c:var(--paused)}.st-missing{--c:var(--missing)}
+.st-paused{--c:var(--paused)}.st-missing,.st-unavailable{--c:var(--missing)}
 header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:var(--s4);padding:var(--s3) var(--s5);background:rgba(19,24,31,.96);border-bottom:1px solid var(--line)}
 header h1{font-size:17px;margin:0;letter-spacing:.3px;font-weight:650}
 .ver{color:var(--faint);font-family:var(--mono);font-size:11px}
@@ -314,6 +314,8 @@ function routeState(spec) {
   if (p.state === 'breaker_open') return { s: 'breaker_open', until: p._until, note: 'breaker open' };
   var m = (p.models || []).filter(function (x) { return x.model === model; })[0];
   if ((p.missing_models || []).indexOf(model) >= 0 || (m && m.state === 'missing')) return { s: 'missing', note: 'model not offered' };
+  if (m && m.state === 'unavailable') return { s: 'unavailable', note: 'refused (403) until restart' };
+  if (m && m.state === 'breaker_open') return { s: 'breaker_open', until: m._until, note: 'route breaker open' };
   if (m && m.state === 'cooling') return { s: 'cooling', until: m._until, note: 'route cooling' };
   if (p.state === 'cooling') return { s: 'cooling', until: p._until, note: 'provider cooling' };
   return { s: 'ok', note: p.paid ? 'paid route' : '' };
@@ -489,6 +491,7 @@ function updateCard(c, p) {
   c.notes.textContent = '';
   if (kd) note(c.notes, 'disabled keys: ' + p.disabled_keys.join(', '), '');
   if ((p.missing_models || []).length) note(c.notes, 'missing models: ' + p.missing_models.join(', '), 'p');
+  if ((p.unavailable_models || []).length) note(c.notes, 'unavailable models (403): ' + p.unavailable_models.join(', '), 'p');
   (p.cooldowns || []).forEach(function (k) {
     note(c.notes, k.scope + ' cooldown' + (k.model ? ' ' + k.model : '') + (k.key ? ' ' + k.key : ''), '', k._until);
   });

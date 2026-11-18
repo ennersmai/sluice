@@ -19,7 +19,7 @@ Each `[[provider]]`:
 
 | Field | Meaning |
 |---|---|
-| `id`, `base_url`, `keys_env` | Name, OpenAI-compatible base URL, and the `.env` variable holding its key(s) |
+| `id`, `base_url`, `keys_env` | Name, OpenAI-compatible base URL, and the `.env` variable holding its key(s). Omit `keys_env` for a keyless gateway: it has one anonymous key slot, no `Authorization` header is sent, and the key shows as `none`. When set it must exist and be non-empty |
 | `paid` | Paid providers are never used by pools, only by an explicit `provider/model` request |
 | `trains_on_input` | Set per provider after reading its terms (see below) |
 | `reset_utc_hour` | Hour (UTC) when the provider's daily quota resets |
@@ -36,6 +36,8 @@ Each `[[provider]]`:
 **Paid providers and the cap**: a `paid = true` provider is reached only by an explicit address such as `or-paid/vendor/model`, never through a pool. Spend is computed from `prices` and the reported token usage, and requests are refused once `paid_daily_cap_usd` is reached for the day (`0` blocks paid entirely). The cap survives restarts.
 
 **Pools and strategies**: a `[[pool]]` has a `name`, a list of `routes` (`provider/upstream-model`) and a `strategy`: `priority` (first healthy route in order), `round_robin`, or `least_used`. Pools cannot contain paid routes. Clients ask for the pool name as the `model`.
+
+**Failure handling**: 401 and 402 disable that key until restart. A 403 marks only that provider/model route `unavailable` until restart (region or plan restrictions) and the next candidate is tried. HTTP 5xx responses count toward a per-route breaker (3 in a row opens that route for 60 s); connect errors and first-byte timeouts count toward a provider-wide breaker.
 
 ## Filling allowlists with `sluice models`
 

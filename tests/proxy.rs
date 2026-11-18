@@ -1769,3 +1769,105 @@ async fn t26_status_and_events_carry_no_key_material_or_message_text() {
     assert!(alpha_p["ttft_ms"]["median"].is_number());
     assert_eq!(status["recent"].as_array().unwrap().len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Keyless providers, per-route 403, per-route 5xx breaker
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyless_provider_sends_no_authorization_upstream() {
+    let mock = Mock::start(Reply::json(200, "{}")).await;
+    let text = format!(
+        "[[provider]]\nid = \"kilo\"\nbase_url = \"{}\"\n",
+        mock.base_url()
+    );
+    let c = Config::from_toml_str(&text, &|_| None).unwrap();
+    assert!(c.providers[0].keys_env.is_none());
+    let router = start_router(c).await;
+    let r = post_json(router, &json!({"model": "kilo/some-model", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    let call = mock.only_call();
+    assert!(!call.headers.contains_key("authorization"));
+    assert_no_client_secret(&call);
+    let status = get_json(router, "/status").await;
+    assert_eq!(status["providers"][0]["keys"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_403_marks_only_that_route_and_the_key_still_serves_other_models() {
+    let alpha = Mock::start(Reply::Sequence(vec![
+        Reply::json(403, "{\"error\":\"not in your region\"}"),
+        Reply::json(200, "{}"),
+    ]))
+    .await;
+    let router = start_router(config(&alpha.base_url(), DEAD, "")).await;
+
+    // Explicit route: the 403 goes back unchanged, but the route is marked.
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/model-a", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 403);
+    // The same key still serves another model on the same provider.
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/some-model:free", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    // The marked route is skipped without an upstream call.
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/model-a", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 503);
+    assert!(r.text().await.unwrap().contains("unavailable"));
+    assert_eq!(alpha.calls().len(), 2);
+
+    let status = get_json(router, "/status?detail=1").await;
+    let alpha_status = &status["providers"][0];
+    assert_eq!(alpha_status["state"], "ok");
+    assert_eq!(alpha_status["unavailable_models"][0], "vendor/model-a");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn five_xx_breaker_is_per_route_and_leaves_other_models_selectable() {
+    let alpha = Mock::start(Reply::Sequence(vec![
+        Reply::json(503, "{\"error\":\"high demand\"}"),
+        Reply::json(503, "{\"error\":\"high demand\"}"),
+        Reply::json(503, "{\"error\":\"high demand\"}"),
+        Reply::json(200, "{}"),
+    ]))
+    .await;
+    let router = start_router(config(&alpha.base_url(), DEAD, "")).await;
+    let a = json!({"model": "alpha/vendor/model-a", "messages": []});
+    for _ in 0..3 {
+        assert_eq!(post_json(router, &a).await.status(), 503);
+    }
+    assert_eq!(alpha.calls().len(), 3);
+    // model-a's breaker is open: no upstream call, 503 from the router.
+    assert_eq!(post_json(router, &a).await.status(), 503);
+    assert_eq!(alpha.calls().len(), 3);
+    // The provider's other model is still served.
+    let r = post_json(
+        router,
+        &json!({"model": "alpha/vendor/some-model:free", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(alpha.calls().len(), 4);
+
+    let status = get_json(router, "/status?detail=1").await;
+    let alpha_status = &status["providers"][0];
+    assert_eq!(alpha_status["state"], "ok");
+    let row = alpha_status["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == "vendor/model-a")
+        .unwrap();
+    assert_eq!(row["state"], "breaker_open");
+    assert!(row["expires_in_ms"].as_u64().unwrap() > 0);
+}

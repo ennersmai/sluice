@@ -5,3 +5,4 @@ state.json.tmp
 *.log
 router.toml
 sluice.log
+router.toml.*

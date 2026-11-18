@@ -22,10 +22,11 @@ pub async fn list_models(
         .first()
         .ok_or_else(|| format!("provider \"{}\" has no API key", provider.id))?;
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-    let response = client
-        .get(&url)
-        .bearer_auth(key.expose())
-        .timeout(TIMEOUT)
+    let mut request = client.get(&url).timeout(TIMEOUT);
+    if !key.is_anonymous() {
+        request = request.bearer_auth(key.expose());
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| format!("GET {url} failed: {}", e.without_url()))?;

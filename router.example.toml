@@ -60,6 +60,13 @@ base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 keys_env = "GEMINI_KEYS"
 trains_on_input = true
 
+# A gateway that needs no API key: omit keys_env. It gets one anonymous key
+# slot and no Authorization header is sent upstream.
+# [[provider]]
+# id = "kilo"
+# base_url = "https://api.kilo.ai/api/gateway"
+# models = ["vendor/example-model:free"]
+
 # A pool may not contain routes to paid providers.
 [[pool]]
 name = "coder"

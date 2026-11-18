@@ -327,8 +327,17 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
                 .filter(|(k, _)| k.model.as_deref() == Some(m.as_str()))
                 .map(|(_, u)| *u)
                 .max();
+            let route_breaker = view
+                .route_breakers
+                .iter()
+                .find(|(n, _)| n == m)
+                .map(|(_, u)| *u);
             let (state_name, until) = if view.missing.contains(m) {
                 ("missing", None)
+            } else if view.unavailable.contains(m) {
+                ("unavailable", None)
+            } else if let Some(u) = route_breaker {
+                ("breaker_open", Some(u))
             } else if let Some(u) = route_cooldown {
                 ("cooling", Some(u))
             } else {
@@ -360,6 +369,7 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
             ),
         );
         o.insert("missing_models".to_string(), json!(view.missing));
+        o.insert("unavailable_models".to_string(), json!(view.unavailable));
         o.insert(
             "cooldowns".to_string(),
             Value::Array(

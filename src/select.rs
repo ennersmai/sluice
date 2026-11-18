@@ -21,6 +21,8 @@ pub enum Skip {
     Paused,
     KeyDisabled,
     Missing,
+    /// The upstream refused this model with a 403 (region or plan).
+    Unavailable,
     BreakerOpen {
         until: Instant,
     },
@@ -51,6 +53,7 @@ impl Skip {
             Self::Paused => "paused",
             Self::KeyDisabled => "key_disabled",
             Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
             Self::BreakerOpen { .. } => "breaker_open",
             Self::Cooldown { .. } => "cooldown",
             Self::Quota { limit, .. } => match limit {

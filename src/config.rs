@@ -43,6 +43,15 @@ impl ApiKey {
         Self(key.into())
     }
 
+    /// The single slot of a keyless provider: no `Authorization` is sent.
+    pub fn anonymous() -> Self {
+        Self(String::new())
+    }
+
+    pub fn is_anonymous(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// The raw key. Only for building outbound `Authorization` headers and
     /// comparing client tokens; never log or return it.
     pub fn expose(&self) -> &str {
@@ -52,6 +61,9 @@ impl ApiKey {
     /// Redacted form safe for logs and the dashboard: `…abcd`, or `****` for
     /// keys too short to show a suffix safely.
     pub fn redacted(&self) -> String {
+        if self.is_anonymous() {
+            return "none".to_string();
+        }
         let chars: Vec<char> = self.0.chars().collect();
         if chars.len() < Self::MIN_LEN_FOR_SUFFIX {
             "****".to_string()
@@ -104,7 +116,8 @@ impl Config {
 pub struct Provider {
     pub id: String,
     pub base_url: String,
-    pub keys_env: String,
+    /// `None` for a keyless provider, which has one anonymous key slot.
+    pub keys_env: Option<String>,
     /// At least one key, in the order given in the environment variable.
     pub keys: Vec<ApiKey>,
     pub paid: bool,
@@ -304,7 +317,8 @@ struct RawConfig {
 struct RawProvider {
     id: String,
     base_url: String,
-    keys_env: String,
+    #[serde(default)]
+    keys_env: Option<String>,
     #[serde(default)]
     paid: bool,
     #[serde(default)]
@@ -510,19 +524,20 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
         }
 
         let mut keys = Vec::new();
-        if rp.keys_env.trim().is_empty() {
-            problems.push(format!("{label}: keys_env must not be empty"));
-        } else {
-            match env(&rp.keys_env) {
+        match rp.keys_env.as_deref() {
+            None => keys.push(ApiKey::anonymous()),
+            Some(var) if var.trim().is_empty() => {
+                problems.push(format!("{label}: keys_env must not be empty"));
+            }
+            Some(var) => match env(var) {
                 None => problems.push(format!(
-                    "{label}: environment variable {} is not set (put it in .env)",
-                    rp.keys_env
+                    "{label}: environment variable {var} is not set (put it in .env)"
                 )),
-                Some(value) => match parse_keys(&rp.keys_env, &value) {
+                Some(value) => match parse_keys(var, &value) {
                     Ok(k) => keys = k,
                     Err(e) => problems.push(format!("{label}: {e}")),
                 },
-            }
+            },
         }
 
         let reset_utc_hour = match u8::try_from(rp.reset_utc_hour) {

@@ -244,6 +244,10 @@ pub struct State {
     breakers: HashMap<String, Breaker>,
     disabled: HashSet<(String, usize)>,
     missing: HashSet<(String, String)>,
+    /// Routes refused with a 403 (region or plan): until restart.
+    unavailable: HashSet<(String, String)>,
+    /// Per-(provider, model) breakers for HTTP 5xx.
+    route_breakers: HashMap<(String, String), Breaker>,
     paused: HashSet<String>,
     requests: HashMap<RouteId, u64>,
     pool_counters: HashMap<String, usize>,
@@ -262,6 +266,8 @@ impl Default for State {
             breakers: HashMap::new(),
             disabled: HashSet::new(),
             missing: HashSet::new(),
+            unavailable: HashSet::new(),
+            route_breakers: HashMap::new(),
             paused: HashSet::new(),
             requests: HashMap::new(),
             pool_counters: HashMap::new(),
@@ -348,6 +354,20 @@ impl RouteView for State {
         if self.missing.contains(&(id.to_string(), model.to_string())) {
             return Some(Skip::Missing);
         }
+        if self
+            .unavailable
+            .contains(&(id.to_string(), model.to_string()))
+        {
+            return Some(Skip::Unavailable);
+        }
+        if let Some(until) = self
+            .route_breakers
+            .get(&(id.to_string(), model.to_string()))
+            .and_then(|b| b.open_until)
+            .filter(|u| *u > now)
+        {
+            return Some(Skip::BreakerOpen { until });
+        }
         if let Some(until) = self
             .breakers
             .get(id)
@@ -422,6 +442,10 @@ pub struct ProviderView {
     pub disabled_keys: Vec<usize>,
     /// Upstream models marked missing.
     pub missing: Vec<String>,
+    /// Upstream models refused with a 403 (region or plan).
+    pub unavailable: Vec<String>,
+    /// Open per-model breakers with their expiry.
+    pub route_breakers: Vec<(String, Instant)>,
     /// Counters of the provider's limit scope, summed over its buckets.
     pub requests_minute: u64,
     pub requests_day: u64,
@@ -602,13 +626,37 @@ impl Limiter {
         })
     }
 
-    /// A 2xx response: reset the backoff at `scope` and the provider's
-    /// breaker count.
-    pub fn record_success(&self, scope: &ScopeKey) {
+    /// A 2xx response: reset the backoff at `scope`, the route's breaker
+    /// count and the provider's breaker count.
+    pub fn record_success(&self, scope: &ScopeKey, model: &str) {
         let mut st = self.lock();
         st.cooldowns.remove(scope);
         if let Some(b) = st.breakers.get_mut(&scope.provider) {
             b.consecutive = 0;
+        }
+        if let Some(b) = st
+            .route_breakers
+            .get_mut(&(scope.provider.clone(), model.to_string()))
+        {
+            b.consecutive = 0;
+        }
+    }
+
+    /// An HTTP 5xx on one route. Returns true when this trips the route's
+    /// breaker.
+    pub fn record_route_failure(&self, provider: &str, model: &str, now: Instant) -> bool {
+        let mut st = self.lock();
+        let b = st
+            .route_breakers
+            .entry((provider.to_string(), model.to_string()))
+            .or_default();
+        b.consecutive = b.consecutive.saturating_add(1);
+        if b.consecutive >= BREAKER_THRESHOLD {
+            b.consecutive = 0;
+            b.open_until = Some(now + BREAKER_OPEN);
+            true
+        } else {
+            false
         }
     }
 
@@ -637,7 +685,7 @@ impl Limiter {
         len
     }
 
-    /// A retryable server-side failure. Returns true when this trips the breaker.
+    /// A connect error or first-byte timeout, counted per provider. Returns true when this trips the breaker.
     pub fn record_server_failure(&self, provider: &str, now: Instant) -> bool {
         let mut st = self.lock();
         let b = st.breakers.entry(provider.to_string()).or_default();
@@ -663,6 +711,14 @@ impl Limiter {
             .insert((provider.to_string(), model.to_string()))
     }
 
+    /// Mark a route unavailable (403: region or plan) until restart.
+    /// Returns true when new.
+    pub fn mark_unavailable(&self, provider: &str, model: &str) -> bool {
+        self.lock()
+            .unavailable
+            .insert((provider.to_string(), model.to_string()))
+    }
+
     pub fn set_paused(&self, provider: &str, paused: bool) {
         let mut st = self.lock();
         if paused {
@@ -683,6 +739,12 @@ impl Limiter {
             !hit
         });
         for (id, b) in st.breakers.iter_mut() {
+            if provider.is_none_or(|p| id == p) {
+                n += usize::from(b.open_until.is_some());
+                *b = Breaker::default();
+            }
+        }
+        for ((id, _), b) in st.route_breakers.iter_mut() {
             if provider.is_none_or(|p| id == p) {
                 n += usize::from(b.open_until.is_some());
                 *b = Breaker::default();
@@ -725,6 +787,20 @@ impl Limiter {
             .map(|(_, m)| m.clone())
             .collect();
         view.missing.sort();
+        view.unavailable = st
+            .unavailable
+            .iter()
+            .filter(|(p, _)| p == id)
+            .map(|(_, m)| m.clone())
+            .collect();
+        view.unavailable.sort();
+        view.route_breakers = st
+            .route_breakers
+            .iter()
+            .filter(|((p, _), _)| p == id)
+            .filter_map(|((_, m), b)| b.open_until.filter(|u| *u > now).map(|u| (m.clone(), u)))
+            .collect();
+        view.route_breakers.sort();
         let day = day_index(st.unix(now), provider.reset_utc_hour);
         // Only the buckets of the provider's own scope, so route buckets
         // that exist for per-model limits are not counted twice.
@@ -1007,7 +1083,7 @@ mod tests {
         assert!(skip(&l, &c, 0, "m", 0, now + Duration::from_secs(119)).is_some());
         assert!(skip(&l, &c, 0, "m", 0, now + Duration::from_secs(120)).is_none());
 
-        l.record_success(&ScopeKey::route("p", 0, "m"));
+        l.record_success(&ScopeKey::route("p", 0, "m"), "m");
         assert!(skip(&l, &c, 0, "m", 0, now).is_none());
         assert_eq!(rate_limit(&l, None, now), 15);
     }
@@ -1058,7 +1134,7 @@ mod tests {
         assert!(skip(&l, &c, 0, "m", 0, now + BREAKER_OPEN).is_none());
         // A success in between resets the count.
         assert!(!l.record_server_failure("q", now));
-        l.record_success(&ScopeKey::route("q", 0, "m"));
+        l.record_success(&ScopeKey::route("q", 0, "m"), "m");
         assert!(!l.record_server_failure("q", now));
         assert!(!l.record_server_failure("q", now));
     }

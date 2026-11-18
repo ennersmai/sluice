@@ -16,7 +16,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::limiter::{CooldownSnap, CreditSpend, DaySnap, ScopeKey, Snapshot, Spend};
+use crate::limiter::{CooldownSnap, CreditSpend, DaySnap, MonthSnap, ScopeKey, Snapshot, Spend};
 
 const VERSION: u32 = 1;
 
@@ -36,6 +36,17 @@ struct File {
     /// Per-provider credit period spend.
     #[serde(default)]
     credit: Vec<CreditPeriod>,
+    /// Month (`tpmo`) token counters.
+    #[serde(default)]
+    months: Vec<Month>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Month {
+    #[serde(flatten)]
+    scope: Scope,
+    period_start_unix: u64,
+    tokens: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +193,15 @@ impl From<Snapshot> for File {
                     usd: cs.usd,
                 })
                 .collect(),
+            months: s
+                .months
+                .into_iter()
+                .map(|m| Month {
+                    scope: m.scope.into(),
+                    period_start_unix: m.period_start,
+                    tokens: m.tokens,
+                })
+                .collect(),
         }
     }
 }
@@ -258,6 +278,15 @@ impl From<File> for Snapshot {
                             },
                         },
                     )
+                })
+                .collect(),
+            months: f
+                .months
+                .into_iter()
+                .map(|m| MonthSnap {
+                    scope: m.scope.into(),
+                    period_start: m.period_start_unix,
+                    tokens: m.tokens,
                 })
                 .collect(),
         }

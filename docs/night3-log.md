@@ -280,3 +280,10 @@ All grep checks from card pass:
 - **Tests:** `credit_seed_applies_only_within_its_period_and_never_double_counts` (limiter), `credit_seed_from_config_makes_the_provider_ineligible` (tests/proxy.rs).
 - **Suite:** fmt, clippy -D warnings clean; 181 passed (119 unit + 5 main + 1 bench + 2 dashboard + 4 health + 50 proxy).
 - **Adapted:** none.
+
+## SL-08: Monthly token limit (tpmo)
+- **Files:** src/select.rs, src/limiter.rs, src/state.rs
+- **What:** `QuotaKind::Tpmo` ("quota_tpmo"). `Bucket` gains `month`/`month_tok` and `roll_month`; `Bucket::check` takes `&Periods { day, day_free, month, month_free }` built in `quota_skip` from `billing::month_start/next_month_start` (month day = `month_reset_day`, at `reset_utc_hour`). The tpmo check follows the tpd check and, like the other token limits, never blocks on an empty counter. `record_usage` adds tokens to `month_tok` for every bucket in `buckets_for`. `ProviderView.tokens_month` (primary buckets). `Snapshot.months: Vec<MonthSnap>` persisted as `months` in the state file (`#[serde(default)]`), restored only when its period is the current one.
+- **Tests:** `tpmo_blocks_until_the_month_boundary`, `tpmo_month_counter_survives_restart` (limiter).
+- **Suite:** fmt, clippy -D warnings clean; 183 passed (121 unit + 5 + 1 + 2 + 4 + 50 proxy).
+- **Adapted:** test anchor is 2026-11-20 12:00 UTC rather than midnight, so `until` checks a non-trivial distance. Remaining-header hints do not touch the month counter.

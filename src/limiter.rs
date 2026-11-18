@@ -140,6 +140,19 @@ struct Bucket {
     day: u64,
     day_req: u64,
     day_tok: u64,
+    /// Start of the current `tpmo` month (Unix seconds).
+    month: u64,
+    month_tok: u64,
+}
+
+/// The day and month periods a quota check runs against.
+#[derive(Debug, Clone, Copy)]
+struct Periods {
+    day: u64,
+    day_free: Instant,
+    /// Start of the current month period (Unix seconds).
+    month: u64,
+    month_free: Instant,
 }
 
 fn window_sum(q: &Window, now: Instant) -> u64 {
@@ -184,6 +197,14 @@ impl Bucket {
         }
     }
 
+    /// Roll the month counter over when the period start changes.
+    fn roll_month(&mut self, start: u64) {
+        if self.month != start {
+            self.month = start;
+            self.month_tok = 0;
+        }
+    }
+
     /// First known limit this request (`estimate` tokens) would exceed.
     /// Token limits never block while their counter is still empty: the
     /// estimate may be wrong, so a first request is always attempted.
@@ -191,10 +212,15 @@ impl Bucket {
         &self,
         limits: &Limits,
         estimate: u64,
-        day: u64,
-        day_free: Instant,
+        periods: &Periods,
         now: Instant,
     ) -> Option<Skip> {
+        let Periods {
+            day,
+            day_free,
+            month,
+            month_free,
+        } = *periods;
         let quota = |limit, until| Some(Skip::Quota { limit, until });
         if let Some(l) = limits.rpm {
             let used = window_sum(&self.win_req, now);
@@ -225,6 +251,17 @@ impl Bucket {
             && day_tok.saturating_add(estimate) > l
         {
             return quota(QuotaKind::Tpd, Some(day_free));
+        }
+        let month_tok = if self.month == month {
+            self.month_tok
+        } else {
+            0
+        };
+        if let Some(l) = limits.tpmo
+            && month_tok > 0
+            && month_tok.saturating_add(estimate) > l
+        {
+            return quota(QuotaKind::Tpmo, Some(month_free));
         }
         None
     }
@@ -332,18 +369,27 @@ impl State {
         let day = day_index(unix, provider.reset_utc_hour);
         let to_reset = day_end(day, provider.reset_utc_hour).saturating_sub(unix);
         let day_free = now + Duration::from_secs(to_reset.max(1));
+        let (d, h) = (provider.month_reset_day, provider.reset_utc_hour);
+        let month = crate::billing::month_start(unix, d, h);
+        let to_month = crate::billing::next_month_start(unix, d, h).saturating_sub(unix);
+        let periods = Periods {
+            day,
+            day_free,
+            month,
+            month_free: now + Duration::from_secs(to_month.max(1)),
+        };
         let scope = scope_key(provider, key, model);
         if let Some(s) = self
             .buckets
             .get(&scope)
-            .and_then(|b| b.check(&provider.limits.limits, estimate, day, day_free, now))
+            .and_then(|b| b.check(&provider.limits.limits, estimate, &periods, now))
         {
             return Some(s);
         }
         let limits = provider.model_limits.get(model)?;
         self.buckets
             .get(&ScopeKey::route(&provider.id, key, model))?
-            .check(limits, estimate, day, day_free, now)
+            .check(limits, estimate, &periods, now)
     }
 
     /// Private helper to compute credit status for a provider.
@@ -533,6 +579,14 @@ pub struct DaySnap {
     pub tokens: u64,
 }
 
+/// A month (`tpmo`) token counter for one bucket, for persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonthSnap {
+    pub scope: ScopeKey,
+    pub period_start: u64,
+    pub tokens: u64,
+}
+
 /// Everything that survives a restart.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
@@ -547,6 +601,8 @@ pub struct Snapshot {
     pub provider_spend: Vec<(String, Spend)>,
     /// Per-provider credit period spend.
     pub credit: Vec<(String, CreditSpend)>,
+    /// Month (`tpmo`) token counters.
+    pub months: Vec<MonthSnap>,
 }
 
 /// State of one provider, with deadlines as `Instant`s.
@@ -571,6 +627,8 @@ pub struct ProviderView {
     pub requests_day: u64,
     pub tokens_minute: u64,
     pub tokens_day: u64,
+    /// Tokens this `tpmo` month.
+    pub tokens_month: u64,
 }
 
 #[derive(Debug, Default)]
@@ -689,10 +747,14 @@ impl Limiter {
         let unix = st.unix(now);
         let day = day_index(unix, provider.reset_utc_hour);
         let total = usage.total();
+        let month =
+            crate::billing::month_start(unix, provider.month_reset_day, provider.reset_utc_hour);
         for scope in State::buckets_for(provider, key, model) {
             let b = st.buckets.entry(scope).or_default();
             b.roll(day);
             b.day_tok = b.day_tok.saturating_add(total);
+            b.roll_month(month);
+            b.month_tok = b.month_tok.saturating_add(total);
             push_window(&mut b.win_tok, now, total);
         }
         let hour = unix / 3600;
@@ -1085,7 +1147,10 @@ impl Limiter {
             .map(|((_, m), c)| (m.clone(), *c))
             .collect();
         view.ceilings.sort();
-        let day = day_index(st.unix(now), provider.reset_utc_hour);
+        let unix = st.unix(now);
+        let day = day_index(unix, provider.reset_utc_hour);
+        let month =
+            crate::billing::month_start(unix, provider.month_reset_day, provider.reset_utc_hour);
         // Only the buckets of the provider's own scope, so route buckets
         // that exist for per-model limits are not counted twice.
         for (k, b) in st.buckets.iter().filter(|(k, _)| k.provider == id) {
@@ -1102,6 +1167,9 @@ impl Limiter {
             if b.day == day {
                 view.requests_day += b.day_req;
                 view.tokens_day += b.day_tok;
+            }
+            if b.month == month {
+                view.tokens_month += b.month_tok;
             }
         }
         view
@@ -1152,6 +1220,16 @@ impl Limiter {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
             credit: st.credit.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            months: st
+                .buckets
+                .iter()
+                .filter(|(_, b)| b.month_tok > 0)
+                .map(|(k, b)| MonthSnap {
+                    scope: k.clone(),
+                    period_start: b.month,
+                    tokens: b.month_tok,
+                })
+                .collect(),
         }
     }
 
@@ -1234,6 +1312,15 @@ impl Limiter {
             let entry = st.credit.entry(p).or_default();
             entry.period_start = cs.period_start;
             entry.usd = entry.usd.max(cs.usd);
+        }
+        // months: keep a counter only when it is for the current period.
+        for m in snap.months {
+            if month_start(&m.scope.provider, unix) != Some(m.period_start) {
+                continue;
+            }
+            let b = st.buckets.entry(m.scope).or_default();
+            b.month = m.period_start;
+            b.month_tok = m.tokens;
         }
     }
 }
@@ -1652,6 +1739,7 @@ mod tests {
             },
             provider_spend: vec![],
             credit: vec![],
+            months: vec![],
         };
         let reset = |id: &str| (id == "p").then_some(0u8);
         let month_start =
@@ -1994,5 +2082,107 @@ out_per_mtok = 0.0
         // Seeding again after the restore does not change it either.
         assert!(fresh.seed_credit(p, now));
         assert!((fresh.credit_spent(p, now) - 5.0).abs() < 1e-9);
+    }
+    fn month_restore(l: &Limiter, snap: Snapshot, reset_day: u8, now: Instant) {
+        l.restore(
+            snap,
+            &|id| (id == "p").then_some(0),
+            &|id, unix| (id == "p").then(|| crate::billing::month_start(unix, reset_day, 0)),
+            &|_, _| true,
+            now,
+        );
+    }
+
+    fn tpmo_until(l: &Limiter, c: &Config, est: u64, now: Instant) -> Option<u64> {
+        match skip(l, c, 0, "m", est, now) {
+            Some(Skip::Quota {
+                limit: QuotaKind::Tpmo,
+                until: Some(u),
+            }) => Some(u.saturating_duration_since(now).as_secs()),
+            other => panic!("expected quota_tpmo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tpmo_blocks_until_the_month_boundary() {
+        use crate::billing::days_from_civil;
+        let day = |y, m, d| u64::try_from(days_from_civil(y, m, d) * 86_400).unwrap_or(0);
+        // 2026-11-20 12:00 UTC
+        let unix = day(2026, 11, 20) + 12 * 3600;
+        let wall = UNIX_EPOCH + Duration::from_secs(unix);
+        let now = Instant::now();
+        let usage = Usage {
+            input: 900,
+            output: 0,
+        };
+
+        let c = cfg("[provider.limits]
+tpmo = 1000");
+        let l = Limiter::with_anchor(now, wall);
+        l.record_usage(
+            &c.providers[0],
+            0,
+            "m",
+            usage,
+            RemainingHints::default(),
+            now,
+            None,
+        );
+        assert_eq!(l.provider_view(&c.providers[0], now).tokens_month, 900);
+        assert!(skip(&l, &c, 0, "m", 50, now).is_none());
+        assert_eq!(
+            skip(&l, &c, 0, "m", 101, now).map(|s| s.name()),
+            Some("quota_tpmo")
+        );
+        assert_eq!(tpmo_until(&l, &c, 101, now), Some(day(2026, 12, 1) - unix));
+
+        let c = cfg("credit_reset_day = 25
+[provider.limits]
+tpmo = 1000");
+        let l = Limiter::with_anchor(now, wall);
+        l.record_usage(
+            &c.providers[0],
+            0,
+            "m",
+            usage,
+            RemainingHints::default(),
+            now,
+            None,
+        );
+        assert_eq!(tpmo_until(&l, &c, 101, now), Some(day(2026, 11, 25) - unix));
+    }
+
+    #[test]
+    fn tpmo_month_counter_survives_restart() {
+        use crate::billing::days_from_civil;
+        let day = |y, m, d| u64::try_from(days_from_civil(y, m, d) * 86_400).unwrap_or(0);
+        let unix = day(2026, 11, 20) + 12 * 3600;
+        let now = Instant::now();
+        let c = cfg("[provider.limits]
+tpmo = 1000");
+        let p = &c.providers[0];
+        let l = Limiter::with_anchor(now, UNIX_EPOCH + Duration::from_secs(unix));
+        let usage = Usage {
+            input: 900,
+            output: 0,
+        };
+        l.record_usage(p, 0, "m", usage, RemainingHints::default(), now, None);
+        let snap = l.snapshot(now);
+        assert_eq!(snap.months.len(), 1);
+
+        // Same period: the same skip happens after a restart.
+        let fresh = Limiter::with_anchor(now, UNIX_EPOCH + Duration::from_secs(unix));
+        month_restore(&fresh, snap.clone(), 1, now);
+        assert_eq!(fresh.provider_view(p, now).tokens_month, 900);
+        assert_eq!(
+            skip(&fresh, &c, 0, "m", 101, now).map(|s| s.name()),
+            Some("quota_tpmo")
+        );
+
+        // Next period (2026-12-02): the old counter is dropped.
+        let later = Limiter::with_anchor(now, UNIX_EPOCH + Duration::from_secs(day(2026, 12, 2)));
+        month_restore(&later, snap, 1, now);
+        assert_eq!(later.provider_view(p, now).tokens_month, 0);
+        assert!(later.snapshot(now).months.is_empty());
     }
 }

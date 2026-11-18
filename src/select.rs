@@ -53,6 +53,8 @@ pub enum QuotaKind {
     Rpd,
     Tpm,
     Tpd,
+    /// Tokens per month (`tpmo`).
+    Tpmo,
 }
 
 impl Skip {
@@ -70,6 +72,7 @@ impl Skip {
                 QuotaKind::Rpd => "quota_rpd",
                 QuotaKind::Tpm => "quota_tpm",
                 QuotaKind::Tpd => "quota_tpd",
+                QuotaKind::Tpmo => "quota_tpmo",
             },
             Self::Privacy => "private_excluded",
             Self::CreditExhausted { .. } => "credit_exhausted",

@@ -2344,3 +2344,62 @@ async fn payment_required_block_survives_restart() {
     assert_eq!(alpha.calls().len(), 1);
     let _ = std::fs::remove_file(&file);
 }
+
+// ---------------------------------------------------------------------------
+// SL-11: Google per-day quota 429s cool the route until the daily reset
+// ---------------------------------------------------------------------------
+
+const GEMINI_PER_DAY_429: &str = r#"[{"error":{"code":429,"message":"You exceeded your current quota. Please retry in 36.5s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","quotaValue":"25"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"36s"}]}}]"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gemini_per_day_429_stops_upstream_calls_until_the_daily_reset() {
+    let alpha = Mock::start(Reply::json(200, "{}")).await;
+    // The retry-after header is there on purpose: the per-day rule wins.
+    let beta = Mock::start(Reply::Full {
+        status: 429,
+        headers: vec![("content-type", "application/json"), ("retry-after", "36")],
+        body: GEMINI_PER_DAY_429.as_bytes().to_vec(),
+    })
+    .await;
+    let extra = "reset_utc_hour = 8\n[provider.limits]\nscope = \"key_model\"\n";
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), extra)).await;
+    let body = json!({"model": "beta/gemini-4-hydrogen", "messages": []});
+
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 429);
+    let mut last = None;
+    for _ in 0..9 {
+        let r = post_json(router, &body).await;
+        assert_eq!(r.status(), 503);
+        let retry_after: u64 = header(&r, "retry-after").parse().unwrap();
+        let v = error_body(r).await;
+        assert_eq!(v["error"]["routes"][0]["reason"], "cooldown");
+        last = Some(retry_after);
+    }
+    assert_eq!(beta.calls().len(), 1);
+
+    let now_unix = sluice::limiter::unix_secs(std::time::SystemTime::now());
+    let expected = sluice::limiter::secs_until_day_reset(now_unix, 8);
+    let got = last.unwrap();
+    assert!(got.abs_diff(expected) <= 5, "{got} vs {expected}");
+    assert!(got > 36 || expected <= 41, "{got}");
+
+    // Contrast: a per-minute quota and no header uses RetryInfo (36 s).
+    let per_minute = GEMINI_PER_DAY_429.replace(
+        "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+        "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+    );
+    let beta = Mock::start(Reply::Full {
+        status: 429,
+        headers: vec![("content-type", "application/json")],
+        body: per_minute.into_bytes(),
+    })
+    .await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), extra)).await;
+    assert_eq!(post_json(router, &body).await.status(), 429);
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 503);
+    let retry_after: u64 = header(&r, "retry-after").parse().unwrap();
+    assert!((36..=37).contains(&retry_after), "{retry_after}");
+    assert_eq!(beta.calls().len(), 1);
+}

@@ -1435,6 +1435,66 @@ pub fn body_hint(body: &[u8]) -> Option<Duration> {
     parse_duration_hint(token)
 }
 
+/// What a Google-style 429 body says about the exhausted quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaHint {
+    /// A `QuotaFailure` violation names a per-day quota.
+    pub per_day: bool,
+    /// `RetryInfo.retryDelay`, when present and parseable.
+    pub retry_delay: Option<Duration>,
+}
+
+/// Parse a Google RPC error body (`error.details[]` with `QuotaFailure` and
+/// `RetryInfo` entries). A top-level array is unwrapped to its first element,
+/// as some OpenAI-compatible endpoints send it. Matches on the body shape
+/// only. None when neither detail is found or the body is not JSON.
+pub fn google_quota_hint(body: &[u8]) -> Option<QuotaHint> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let v = match &v {
+        serde_json::Value::Array(items) => items.first()?,
+        other => other,
+    };
+    let details = v.get("error")?.get("details")?.as_array()?;
+    let mut per_day = false;
+    let mut quota_failure = false;
+    let mut retry_delay = None;
+    for d in details {
+        let kind = d.get("@type").and_then(|t| t.as_str()).unwrap_or_default();
+        if kind.ends_with("QuotaFailure") {
+            quota_failure = true;
+            per_day |= d
+                .get("violations")
+                .and_then(|v| v.as_array())
+                .is_some_and(|vs| {
+                    vs.iter().any(|v| {
+                        v.get("quotaId")
+                            .and_then(|q| q.as_str())
+                            .is_some_and(|q| q.contains("PerDay"))
+                    })
+                });
+        } else if kind.ends_with("RetryInfo") {
+            retry_delay = d
+                .get("retryDelay")
+                .and_then(|r| r.as_str())
+                .and_then(parse_duration_hint)
+                .or(retry_delay);
+        }
+    }
+    (quota_failure || retry_delay.is_some()).then_some(QuotaHint {
+        per_day,
+        retry_delay,
+    })
+}
+
+/// Seconds from `unix` to the next daily reset at `reset_hour` UTC, at least 1.
+pub fn secs_until_day_reset(unix: u64, reset_hour: u8) -> u64 {
+    let secs = day_end(day_index(unix, reset_hour), reset_hour).saturating_sub(unix);
+    // `day_index` saturates before the first reset after the epoch, which
+    // would put the next reset a day too late; a reset is never > 24 h away.
+    let secs = if secs > 86_400 { secs - 86_400 } else { secs };
+    secs.max(1)
+}
+
 /// Clamp a precise hint to between 1 s and 24 h.
 pub fn clamp_hint(d: Duration) -> Duration {
     d.clamp(Duration::from_secs(1), MAX_RETRY_AFTER)
@@ -2213,5 +2273,42 @@ tpmo = 1000");
         month_restore(&later, snap, 1, now);
         assert_eq!(later.provider_view(p, now).tokens_month, 0);
         assert!(later.snapshot(now).months.is_empty());
+    }
+
+    const GEMINI_PER_DAY: &str = r#"[{"error":{"code":429,"message":"You exceeded your current quota. Please retry in 36.5s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","quotaValue":"25"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"36s"}]}}]"#;
+
+    #[test]
+    fn google_quota_failure_per_day_and_retry_info_are_parsed() {
+        let want = Some(QuotaHint {
+            per_day: true,
+            retry_delay: Some(Duration::from_secs(36)),
+        });
+        assert_eq!(google_quota_hint(GEMINI_PER_DAY.as_bytes()), want);
+        let object = GEMINI_PER_DAY
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or_default();
+        assert_eq!(google_quota_hint(object.as_bytes()), want);
+        let per_minute = GEMINI_PER_DAY.replace(
+            "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+            "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+        );
+        assert_eq!(
+            google_quota_hint(per_minute.as_bytes()),
+            Some(QuotaHint {
+                per_day: false,
+                retry_delay: Some(Duration::from_secs(36)),
+            })
+        );
+        assert_eq!(google_quota_hint(b"{}"), None);
+        assert_eq!(google_quota_hint(b"[]"), None);
+        assert_eq!(google_quota_hint(b"not json"), None);
+    }
+
+    #[test]
+    fn secs_until_day_reset_examples() {
+        assert_eq!(secs_until_day_reset(0, 0), 86_400);
+        assert_eq!(secs_until_day_reset(7 * 3600, 8), 3600);
+        assert_eq!(secs_until_day_reset(9 * 3600, 8), 23 * 3600);
     }
 }

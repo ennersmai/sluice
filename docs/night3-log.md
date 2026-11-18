@@ -301,3 +301,10 @@ All grep checks from card pass:
 - **Tests:** `error_excerpt_is_bounded_single_line_and_redacts_keys` (proxy unit).
 - **Suite:** fmt, clippy -D warnings clean; 186 passed (122 unit + 5 + 1 + 2 + 4 + 52 proxy).
 - **Adapted:** each of the two lines has two `elog!` forms (with and without the body) so the format strings themselves contain `body=\"{e}\"`, which the card's grep checks for.
+
+## SL-11: Google per-day quota 429s cool the route until the daily reset
+- **Files:** src/limiter.rs, src/proxy.rs, tests/proxy.rs
+- **What:** `QuotaHint { per_day, retry_delay }` and `google_quota_hint(body)`: parses `error.details[]` (top-level array unwrapped to its first element); a `...QuotaFailure` entry with any `violations[].quotaId` containing `PerDay` sets `per_day`; `...RetryInfo.retryDelay` goes through `parse_duration_hint`. Body shape only, no provider ids. `secs_until_day_reset(unix, reset_hour)`. In `forward`, a 429's cooldown precedence is now: per-day -> until the provider's next `reset_utc_hour` (attempt reason `http_429_per_day`); else header hint; else `RetryInfo` (clamped); else "try again in" body text (clamped); else backoff. The cooldown goes through the existing scope key (respects `key_model`), keeps the backoff step, and is persisted by the snapshot since it is > 60 s. The warn line says `(429 daily quota exhausted, until next reset_utc_hour=H)` and keeps the SL-10 body excerpt.
+- **Tests:** `google_quota_failure_per_day_and_retry_info_are_parsed`, `secs_until_day_reset_examples` (limiter); `gemini_per_day_429_stops_upstream_calls_until_the_daily_reset` (tests/proxy.rs: 1 upstream call for 10 requests, 503 `cooldown` with retry-after within 5 s of the next 08:00 UTC; contrast per-minute body without header gives 36..=37 s).
+- **Suite:** fmt, clippy -D warnings clean; 188 passed (124 unit + 5 + 1 + 2 + 4 + 53 proxy).
+- **Adapted:** `secs_until_day_reset` subtracts a day when the result exceeds 24 h. The card's formula `day_end(day_index(unix,h),h) - unix` gives 90000 for `(7*3600, 8)` because `day_index` saturates before the first reset after the epoch; the card's own example expects 3600. Real-world times are unaffected.

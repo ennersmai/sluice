@@ -399,14 +399,33 @@ async fn forward(
                 apply_failure(state, entry, Class::ServerError, None, "timeout", None);
                 continue;
             };
-            let retry_after = match (class, hint) {
-                (_, Some(d)) => Some(d),
-                (Class::RateLimited, None) => limiter::body_hint(&body).map(limiter::clamp_hint),
-                _ => None,
+            let google = (class == Class::RateLimited)
+                .then(|| limiter::google_quota_hint(&body))
+                .flatten();
+            let per_day = google.is_some_and(|g| g.per_day);
+            // 429 precedence: a per-day quota cools until the provider's next
+            // daily reset; then the header hint, Google's RetryInfo, the
+            // "try again in" body text; else the exponential backoff.
+            let retry_after = if per_day {
+                Some(Duration::from_secs(limiter::secs_until_day_reset(
+                    limiter::unix_secs(SystemTime::now()),
+                    provider.reset_utc_hour,
+                )))
+            } else {
+                match (class, hint) {
+                    (_, Some(d)) => Some(d),
+                    (Class::RateLimited, None) => google
+                        .and_then(|g| g.retry_delay)
+                        .or_else(|| limiter::body_hint(&body))
+                        .map(limiter::clamp_hint),
+                    _ => None,
+                }
             };
             let reason = if class == Class::TooLarge {
                 learn_ceiling(state, provider, entry.model, req.estimate);
                 "too_large".to_string()
+            } else if per_day {
+                "http_429_per_day".to_string()
             } else {
                 format!("http_{}", status.as_u16())
             };
@@ -770,12 +789,20 @@ fn apply_failure(
             let scope = limiter::scope_key(entry.provider, entry.key_idx, model);
             let len = state.limiter.record_rate_limit(scope, retry_after, now);
             let secs = len.as_secs();
+            let why = if detail == "http_429_per_day" {
+                format!(
+                    "429 daily quota exhausted, until next reset_utc_hour={}",
+                    entry.provider.reset_utc_hour
+                )
+            } else {
+                "429".to_string()
+            };
             match excerpt() {
                 Some(e) => crate::elog!(
-                    "warn: cooldown provider={provider} key={key} model={model} for {secs}s (429) body=\"{e}\""
+                    "warn: cooldown provider={provider} key={key} model={model} for {secs}s ({why}) body=\"{e}\""
                 ),
                 None => crate::elog!(
-                    "warn: cooldown provider={provider} key={key} model={model} for {secs}s (429)"
+                    "warn: cooldown provider={provider} key={key} model={model} for {secs}s ({why})"
                 ),
             }
             events.route_state(provider, Some(model), Some(key), "cooldown", Some(len));

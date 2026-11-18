@@ -217,18 +217,20 @@ mod tests {
 id = "alpha"
 base_url = "https://alpha.example/v1"
 keys_env = "K"
+billing = "free"
 models = ["vendor/model-a", "vendor/some-model:free"]
 
 [[provider]]
 id = "beta"
 base_url = "https://beta.example/v1"
 keys_env = "K"
+billing = "free"
 
 [[provider]]
 id = "money"
 base_url = "https://alpha.example/v1"
 keys_env = "K"
-paid = true
+billing = "paid"
 models = ["vendor/model-a-pro"]
 
 [[pool]]

@@ -18,7 +18,7 @@ fn t25_dashboard_file_has_no_external_urls_and_is_small() {
 async fn t25_root_serves_the_dashboard_as_html() {
     let env: HashMap<&str, &str> = [("MOCK_KEYS", "mock-key-00000001")].into();
     let config = Config::from_toml_str(
-        "[[provider]]\nid = \"mock\"\nbase_url = \"http://127.0.0.1:9/v1\"\nkeys_env = \"MOCK_KEYS\"\n",
+        "[[provider]]\nid = \"mock\"\nbase_url = \"http://127.0.0.1:9/v1\"\nkeys_env = \"MOCK_KEYS\"\nbilling = \"free\"\n",
         &|k| env.get(k).map(|v| v.to_string()),
     )
     .unwrap();

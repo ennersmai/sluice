@@ -1140,7 +1140,7 @@ mod tests {
 
     fn cfg(extra: &str) -> Config {
         let text = format!(
-            "[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\n{extra}\n"
+            "[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\nbilling = \"free\"\n{extra}\n"
         );
         Config::from_toml_str(&text, &|_| Some("key-aaaa-0001,key-aaaa-0002".to_string()))
             .unwrap_or_else(|e| panic!("{e}"))

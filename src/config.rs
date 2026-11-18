@@ -123,6 +123,7 @@ pub struct Provider {
     /// At least one key, in the order given in the environment variable.
     pub keys: Vec<ApiKey>,
     pub paid: bool,
+    pub billing: Billing,
     pub trains_on_input: bool,
     pub reset_utc_hour: u8,
     pub drop_params: Vec<String>,
@@ -132,6 +133,7 @@ pub struct Provider {
     /// Per-model overrides, always `key_model` scoped.
     pub model_limits: BTreeMap<String, Limits>,
     pub prices: BTreeMap<String, Price>,
+    pub usage_cost_field: Option<String>,
 }
 
 impl Provider {
@@ -149,6 +151,32 @@ pub enum LimitScope {
     Provider,
     Key,
     KeyModel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Billing {
+    Free,
+    Credit,
+    Paid,
+}
+
+impl Billing {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "free" => Some(Self::Free),
+            "credit" => Some(Self::Credit),
+            "paid" => Some(Self::Paid),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Credit => "credit",
+            Self::Paid => "paid",
+        }
+    }
 }
 
 impl LimitScope {
@@ -330,7 +358,9 @@ struct RawProvider {
     #[serde(default)]
     keys_env: Option<String>,
     #[serde(default)]
-    paid: bool,
+    paid: Option<bool>,
+    #[serde(default)]
+    billing: Option<String>,
     #[serde(default)]
     trains_on_input: bool,
     #[serde(default)]
@@ -345,6 +375,8 @@ struct RawProvider {
     model_limits: BTreeMap<String, RawLimits>,
     #[serde(default)]
     prices: BTreeMap<String, RawPrice>,
+    #[serde(default)]
+    usage_cost_field: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -647,12 +679,58 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
             );
         }
 
+        // Resolve billing type according to the rules:
+        // - billing unset, paid unset -> Paid
+        // - billing unset, paid = true -> Paid
+        // - billing unset, paid = false -> error "paid = false no longer means free; set billing = "free" (or "credit")"
+        // - billing set to valid X, paid unset -> X
+        // - billing = "paid" with paid = true, or billing = "free"/"credit" with paid = false -> X (redundant but allowed)
+        // - billing = "paid" with paid = false, or billing = "free"/"credit" with paid = true -> error "paid = {v} conflicts with billing = "{b}""
+        // - invalid billing string -> error "billing = "{s}" must be one of free, credit, paid"
+        let (billing, paid) = match (&rp.billing, rp.paid) {
+            (None, None) => (Billing::Paid, true),
+            (None, Some(true)) => (Billing::Paid, true),
+            (None, Some(false)) => {
+                problems.push(format!(
+                    "{label}: paid = false no longer means free; set billing = \"free\" (or \"credit\")"
+                ));
+                (Billing::Paid, true) // default to paid to avoid silently allowing pool inclusion
+            }
+            (Some(b_str), None) => match Billing::parse(b_str) {
+                Some(b) => (b, b == Billing::Paid),
+                None => {
+                    problems.push(format!(
+                        "{label}: billing = \"{b_str}\" must be one of free, credit, paid"
+                    ));
+                    (Billing::Paid, true)
+                }
+            },
+            (Some(b_str), Some(paid_val)) => match Billing::parse(b_str) {
+                Some(b) => {
+                    let paid_from_billing = b == Billing::Paid;
+                    if paid_from_billing != paid_val {
+                        problems.push(format!(
+                            "{label}: paid = {paid_val} conflicts with billing = \"{b_str}\""
+                        ));
+                    }
+                    (b, b == Billing::Paid)
+                }
+                None => {
+                    problems.push(format!(
+                        "{label}: billing = \"{b_str}\" must be one of free, credit, paid"
+                    ));
+                    (Billing::Paid, true)
+                }
+            },
+        };
+
         providers.push(Provider {
             id: rp.id.clone(),
             base_url: base_url.to_string(),
             keys_env: rp.keys_env.clone(),
             keys,
-            paid: rp.paid,
+            paid,
+            billing,
             trains_on_input: rp.trains_on_input,
             reset_utc_hour,
             drop_params: rp.drop_params.clone(),
@@ -660,6 +738,7 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
             limits,
             model_limits,
             prices,
+            usage_cost_field: rp.usage_cost_field.clone(),
         });
     }
 
@@ -830,6 +909,7 @@ mod tests {
 id = "a"
 base_url = "https://a.example/v1"
 keys_env = "A_KEYS"
+billing = "free"
 "#;
 
     /// The PRD section 5 example verbatim, plus the `nvidia` and `groq`
@@ -847,7 +927,7 @@ paid_daily_cap_usd = 1.00   # applies to explicit paid requests, 0 blocks paid e
 id = "or-free"
 base_url = "https://openrouter.ai/api/v1"
 keys_env = "OPENROUTER_KEYS"
-paid = false
+billing = "free"
 trains_on_input = false     # set per provider after reading its terms
 reset_utc_hour = 0
 drop_params = []            # request fields this provider rejects
@@ -867,7 +947,7 @@ rpm = 0
 id = "or-paid"
 base_url = "https://openrouter.ai/api/v1"
 keys_env = "OPENROUTER_KEYS"
-paid = true
+billing = "paid"
 models = ["vendor/example-paid-model"]
 [provider.prices."vendor/example-paid-model"]
 in_per_mtok = 0.0
@@ -877,6 +957,7 @@ out_per_mtok = 0.0
 id = "gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 keys_env = "GEMINI_KEYS"
+billing = "free"
 trains_on_input = true
 
 [[pool]]
@@ -888,11 +969,13 @@ routes = ["or-free/vendor/example-model:free", "nvidia/vendor/example-model", "g
 id = "nvidia"
 base_url = "https://integrate.api.nvidia.com/v1"
 keys_env = "NVIDIA_KEYS"
+billing = "free"
 
 [[provider]]
 id = "groq"
 base_url = "https://api.groq.com/openai/v1"
 keys_env = "GROQ_KEYS"
+billing = "free"
 "#;
 
     // ---- defaults ----
@@ -1283,6 +1366,7 @@ keys_env = "GROQ_KEYS"
 id = "free"
 base_url = "https://x.example/v1"
 keys_env = "A_KEYS"
+billing = "free"
 
 [[provider]]
 id = "paid"
@@ -1316,6 +1400,119 @@ routes = ["free/vendor/example-model", "paid/vendor/example-paid-model"]
             &text,
             "pool \"coder\": route \"or-paid/vendor/example-paid-model\" uses paid provider \"or-paid\"",
         );
+    }
+
+    // ---- billing ----
+
+    #[test]
+    fn unset_billing_is_paid_and_rejected_in_pool() {
+        // A provider with neither billing nor paid has paid == true and billing == Billing::Paid
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+"#;
+        let c = ok(text);
+        let p = c.provider("p").unwrap();
+        assert!(p.paid);
+        assert_eq!(p.billing, Billing::Paid);
+
+        // Putting it in a pool fails with "uses paid provider"
+        let text_with_pool = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+
+[[pool]]
+name = "coder"
+routes = ["p/m"]
+"#;
+        err(text_with_pool, "uses paid provider");
+    }
+
+    #[test]
+    fn billing_values_parse() {
+        // free, credit and paid each parse
+        for b in ["free", "credit", "paid"] {
+            let text = format!(
+                r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "{}"
+"#,
+                b
+            );
+            let c = ok(&text);
+            assert_eq!(c.provider("p").unwrap().billing.name(), b);
+        }
+        // billing = "gratis" gives the "must be one of" error
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "gratis"
+"#;
+        err(text, "must be one of free, credit, paid");
+    }
+
+    #[test]
+    fn paid_bool_maps_to_billing_and_conflicts_are_rejected() {
+        // paid = true alone is Paid
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+paid = true
+"#;
+        let c = ok(text);
+        let p = c.provider("p").unwrap();
+        assert!(p.paid);
+        assert_eq!(p.billing, Billing::Paid);
+
+        // billing = "free" with paid = true errors with "conflicts with billing"
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "free"
+paid = true
+"#;
+        err(text, "conflicts with billing");
+
+        // billing = "paid" with paid = true is accepted (redundant but allowed)
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "paid"
+paid = true
+"#;
+        let c = ok(text);
+        let p = c.provider("p").unwrap();
+        assert!(p.paid);
+        assert_eq!(p.billing, Billing::Paid);
+    }
+
+    #[test]
+    fn paid_false_without_billing_is_rejected() {
+        // The error contains "no longer means free"
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+paid = false
+"#;
+        let msg = err(text, "no longer means free");
+        assert!(msg.contains("set billing = \"free\""));
     }
 
     // ---- limits scope ----

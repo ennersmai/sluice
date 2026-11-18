@@ -1663,6 +1663,7 @@ mod tests {
 id = \"p\"
 base_url = \"http://p/v1\"
 keys_env = \"K\"
+billing = \"free\"
 ";
         let config = crate::config::Config::from_toml_str(text, &|_| Some("k".into())).unwrap();
         let state = AppState::new(config).unwrap();

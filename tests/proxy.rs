@@ -233,6 +233,12 @@ fn config(alpha: &str, beta: &str, extra: &str) -> Config {
 
 /// Like `config`, with top-level settings and alpha's `ALPHA_KEYS` value.
 fn config_full(top: &str, alpha: &str, beta: &str, extra: &str, alpha_keys: &str) -> Config {
+    let alpha_billing = "billing = \"free\"\n";
+    let beta_billing = if extra.contains("billing") {
+        ""
+    } else {
+        "billing = \"free\"\n"
+    };
     let text = format!(
         r#"
 {top}
@@ -240,19 +246,19 @@ fn config_full(top: &str, alpha: &str, beta: &str, extra: &str, alpha_keys: &str
 id = "alpha"
 base_url = "{alpha}"
 keys_env = "ALPHA_KEYS"
-models = ["vendor/model-a", "vendor/some-model:free"]
+{alpha_billing}models = ["vendor/model-a", "vendor/some-model:free"]
 
 [[provider]]
 id = "beta"
 base_url = "{beta}"
 keys_env = "BETA_KEYS"
-{extra}
+{beta_billing}{extra}
 
 [[provider]]
 id = "money"
 base_url = "{alpha}"
 keys_env = "PAID_KEYS"
-paid = true
+billing = "paid"
 models = ["vendor/model-a-pro", "vendor/model-a-noprice"]
 [provider.prices."vendor/model-a-pro"]
 in_per_mtok = 10.0
@@ -1965,7 +1971,7 @@ async fn t26_status_and_events_carry_no_key_material_or_message_text() {
 async fn keyless_provider_sends_no_authorization_upstream() {
     let mock = Mock::start(Reply::json(200, "{}")).await;
     let text = format!(
-        "[[provider]]\nid = \"kilo\"\nbase_url = \"{}\"\n",
+        "[[provider]]\nid = \"kilo\"\nbase_url = \"{}\"\nbilling = \"free\"\n",
         mock.base_url()
     );
     let c = Config::from_toml_str(&text, &|_| None).unwrap();

@@ -25,7 +25,7 @@ async fn t27_router_overhead_p95_is_under_2ms() {
 
     let env: HashMap<&str, &str> = [("MOCK_KEYS", "mock-key-00000001")].into();
     let text = format!(
-        "[[provider]]\nid = \"mock\"\nbase_url = \"http://{upstream_addr}/v1\"\nkeys_env = \"MOCK_KEYS\"\n"
+        "[[provider]]\nid = \"mock\"\nbase_url = \"http://{upstream_addr}/v1\"\nkeys_env = \"MOCK_KEYS\"\nbilling = \"free\"\n"
     );
     let config = Config::from_toml_str(&text, &|k| env.get(k).map(|v| v.to_string())).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

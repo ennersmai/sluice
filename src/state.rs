@@ -264,7 +264,7 @@ mod tests {
 
     fn state_with_file(path: &Path) -> std::sync::Arc<AppState> {
         let text = format!(
-            "state_file = '{}'\n[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\n",
+            "state_file = '{}'\n[[provider]]\nid = \"p\"\nbase_url = \"http://p/v1\"\nkeys_env = \"K\"\nbilling = \"free\"\n",
             path.display()
         );
         let config = Config::from_toml_str(&text, &|_| Some("k".into())).unwrap();

@@ -211,10 +211,12 @@ mod tests {
 id = "a"
 base_url = "http://a/v1"
 keys_env = "A_KEYS"
+billing = "free"
 [[provider]]
 id = "b"
 base_url = "http://b/v1"
 keys_env = "B_KEYS"
+billing = "free"
 trains_on_input = true
 [[pool]]
 name = "p"

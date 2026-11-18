@@ -14,12 +14,16 @@ stream_idle_timeout_secs = 60  # silence allowed once the body has started, 0 di
 max_wait_secs = 15          # hold a request this long if a route frees up soon, 0 disables
 private_default = false
 paid_daily_cap_usd = 1.00   # applies to explicit paid requests, 0 blocks paid entirely
+# session_headers = ["x-session-id", "x-opencode-session"]
+# sticky_ttl_secs = 7200
 
+# billing: free | credit | paid; unset means paid
 [[provider]]
 id = "or-free"
 base_url = "https://openrouter.ai/api/v1"
 keys_env = "OPENROUTER_KEYS"
-paid = false
+billing = "free"
+usage_cost_field = "cost"
 trains_on_input = false     # set per provider after reading its terms
 reset_utc_hour = 0
 drop_params = []            # request fields this provider rejects
@@ -41,7 +45,7 @@ rpm = 0
 id = "or-paid"              # paid providers are reachable only by explicit route
 base_url = "https://openrouter.ai/api/v1"
 keys_env = "OPENROUTER_KEYS"
-paid = true
+billing = "paid"
 models = ["vendor/example-paid-model"]
 [provider.prices."vendor/example-paid-model"]
 in_per_mtok = 0.0
@@ -51,17 +55,36 @@ out_per_mtok = 0.0
 id = "nvidia"
 base_url = "https://integrate.api.nvidia.com/v1"
 keys_env = "NVIDIA_KEYS"
+billing = "free"
 
 [[provider]]
 id = "groq"
 base_url = "https://api.groq.com/openai/v1"
 keys_env = "GROQ_KEYS"
+billing = "free"
 
 [[provider]]
 id = "gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 keys_env = "GEMINI_KEYS"
+billing = "free"
 trains_on_input = true
+reset_utc_hour = 8  # Google resets at midnight Pacific; 8 is safe in both PST and PDT
+
+# Credit provider example (Mistral):
+# [[provider]]
+# id = "mistral"
+# base_url = "https://api.mistral.ai/v1"
+# keys_env = "MISTRAL_KEYS"
+# billing = "credit"
+# credit_usd = 10.0
+# credit_reset_day = 1
+# credit_spent_usd = 0.0  # seed: applies only to the credit period containing credit_spent_date
+# credit_spent_date = "2026-01-01"
+# tpmo = 0  # tokens per month, 0 = unknown
+# [provider.prices."example-model"]
+# in_per_mtok = 0.0
+# out_per_mtok = 0.0
 
 # A gateway that needs no API key: omit keys_env. It gets one anonymous key
 # slot and no Authorization header is sent upstream.

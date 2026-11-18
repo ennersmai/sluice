@@ -17,6 +17,7 @@ const PROVIDER: &str = r#"
 id = "mock"
 base_url = "http://127.0.0.1:9/v1"
 keys_env = "MOCK_KEYS"
+billing = "free"
 "#;
 
 const CLIENT_TOKEN: &str = "client-token-for-tests-1234";

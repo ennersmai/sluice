@@ -8,6 +8,40 @@
 
 ---
 
+## SL-01: Billing type enum and config parsing (completed 2026-11-19)
+
+### Files changed
+- src/config.rs: Added `Billing` enum (Free, Credit, Paid), added `billing` field to `Provider`, changed `RawProvider.paid` to `Option<bool>`, added `billing: Option<String>` and `usage_cost_field: Option<String>`, implemented validation logic per card rules
+- src/catalog.rs: Updated test fixture CONFIG with billing = "free" for alpha/beta, billing = "paid" for money
+- src/select.rs: Updated test fixture config() with billing = "free" for providers a and b
+- src/limiter.rs: Updated test fixture cfg() with billing = "free"
+- src/proxy.rs: Updated test fixture tap() with billing = "free"
+- src/state.rs: Updated test fixture state_with_file() with billing = "free"
+- tests/proxy.rs: Updated config_full() with billing for alpha/beta/money; added billing to keyless test
+- tests/health.rs: Updated PROVIDER constant with billing = "free"
+- tests/dashboard.rs: Updated test config with billing = "free"
+- tests/bench.rs: Updated test config with billing = "free"
+- router.example.toml: Updated or-free (paid=false → billing="free"), or-paid (paid=true → billing="paid"), added billing="free" to nvidia/groq/gemini, added usage_cost_field="cost" to or-free, added session_headers/sticky_ttl_secs comments, added mistral credit example block, added reset_utc_hour=8 comment for gemini
+
+### Tests added (4 new tests in config.rs)
+- `unset_billing_is_paid_and_rejected_in_pool`: provider with neither billing nor paid has paid=true, billing=Paid; pool inclusion fails
+- `billing_values_parse`: free/credit/paid parse correctly; "gratis" gives error
+- `paid_bool_maps_to_billing_and_conflicts_are_rejected`: paid=true alone is Paid; billing="free" with paid=true conflicts; billing="paid" with paid=true accepted
+- `paid_false_without_billing_is_rejected`: paid=false without billing gives "no longer means free" error
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 105 unit tests + 5 main tests + 1 bench + 2 dashboard + 4 health + 46 proxy = 163 tests PASS
+
+### Verification
+All grep checks from card pass:
+- `grep -nE "pub enum Billing" src/config.rs` → line 157
+- `grep -nE "pub billing: Billing" src/config.rs` → line 126
+- `grep -nE "paid: Option<bool>" src/config.rs` → line 361
+
+---
+
 ## Provider billing audit (step 7), checked 2026-11-19
 
 Rule applied: where the provider's current documentation does not clearly confirm a standing free tier with no possibility of charges, billing = "paid" (removed from pools) and listed for Mai.

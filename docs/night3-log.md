@@ -170,3 +170,27 @@ Mistral prices (USD per million tokens, input / output), from docs.mistral.ai/in
 - All 167 tests pass
 
 ---
+
+## SL-03: Config fields for credit providers, monthly token limits and price fallback (completed 2026-11-19)
+
+### Files changed
+- src/config.rs: Added credit fields to `RawProvider` (credit_usd, credit_reset_day, credit_spent_usd, credit_spent_date), added `tpmo` to `RawProviderLimits` and `Limits`, added `Credit` and `CreditSeed` structs, added `credit: Option<Credit>` and `month_reset_day: u8` to `Provider`, implemented validation rules per card, added `Provider::price_for()` method with highest-price fallback
+
+### Tests added (4 new tests in config.rs)
+- `credit_provider_without_prices_refuses_to_start`: billing=credit with credit_usd and reset_day but no prices gives "at least one [provider.prices]" error
+- `unpriced_model_uses_the_highest_configured_price`: prices a={1,4} and b={3,2}; price_for("a")={1,4}; price_for("zzz")={3,4}; provider with no prices returns None
+- `credit_fields_are_validated`: covers missing credit_usd, credit_usd=0, reset_day 0 and 32, credit_usd on free provider, spent amount without date, bad date; valid credit provider has correct Credit and month_reset_day
+- `tpmo_parses_and_month_day_defaults_to_first`: [provider.limits] tpmo=3000000 gives Some(3_000_000), month_reset_day==1 when unset; tpmo under model_limits rejected by deny_unknown_fields
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 113 unit tests + 5 main tests + 1 bench + 2 dashboard + 4 health + 46 proxy = 171 tests PASS
+
+### Verification
+All grep checks from card pass:
+- `grep -nE "pub fn price_for" src/config.rs` → line 158
+- `grep -nE "pub credit: Option<Credit>" src/config.rs` → line 138
+- `grep -nE "pub tpmo: Option<u64>" src/config.rs` → line 235
+
+---

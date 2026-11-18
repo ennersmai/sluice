@@ -134,6 +134,11 @@ pub struct Provider {
     pub model_limits: BTreeMap<String, Limits>,
     pub prices: BTreeMap<String, Price>,
     pub usage_cost_field: Option<String>,
+    /// Credit configuration. `Some` exactly when `billing == Billing::Credit`.
+    pub credit: Option<Credit>,
+    /// The day of month (1-31) at which the credit/tpmo period resets.
+    /// Defaults to 1 when not set.
+    pub month_reset_day: u8,
 }
 
 impl Provider {
@@ -143,6 +148,34 @@ impl Provider {
             Some(list) => list.iter().any(|m| m == model),
             None => true,
         }
+    }
+
+    /// Returns the price for a model. If the model has an exact entry, returns it.
+    /// Otherwise, if prices is non-empty, returns the highest configured price
+    /// (max in_per_mtok and max out_per_mtok taken separately).
+    /// Returns `None` only when prices is empty.
+    /// An unpriced model is charged at the highest configured price.
+    pub fn price_for(&self, model: &str) -> Option<Price> {
+        if let Some(p) = self.prices.get(model) {
+            return Some(*p);
+        }
+        if self.prices.is_empty() {
+            return None;
+        }
+        let mut max_in = 0.0;
+        let mut max_out = 0.0;
+        for p in self.prices.values() {
+            if p.in_per_mtok > max_in {
+                max_in = p.in_per_mtok;
+            }
+            if p.out_per_mtok > max_out {
+                max_out = p.out_per_mtok;
+            }
+        }
+        Some(Price {
+            in_per_mtok: max_in,
+            out_per_mtok: max_out,
+        })
     }
 }
 
@@ -198,6 +231,8 @@ pub struct Limits {
     pub rpd: Option<u64>,
     pub tpm: Option<u64>,
     pub tpd: Option<u64>,
+    /// Tokens per month. Only in `[provider.limits]`, not in `model_limits`.
+    pub tpmo: Option<u64>,
     /// Largest request (pre-flight token estimate) the model accepts.
     /// Only meaningful in `model_limits`.
     pub max_input_tokens: Option<u64>,
@@ -222,6 +257,21 @@ impl Default for ProviderLimits {
 pub struct Price {
     pub in_per_mtok: f64,
     pub out_per_mtok: f64,
+}
+
+/// Credit configuration for a provider with `billing = "credit"`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Credit {
+    pub usd: f64,
+    pub seed: Option<CreditSeed>,
+}
+
+/// Seed spend from config: applies as a floor to the current credit period.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreditSeed {
+    pub usd: f64,
+    /// Day since epoch (from `billing::parse_date`).
+    pub day: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +427,14 @@ struct RawProvider {
     prices: BTreeMap<String, RawPrice>,
     #[serde(default)]
     usage_cost_field: Option<String>,
+    #[serde(default)]
+    credit_usd: Option<f64>,
+    #[serde(default)]
+    credit_reset_day: Option<i64>,
+    #[serde(default)]
+    credit_spent_usd: Option<f64>,
+    #[serde(default)]
+    credit_spent_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -392,6 +450,8 @@ struct RawProviderLimits {
     tpm: u64,
     #[serde(default)]
     tpd: u64,
+    #[serde(default)]
+    tpmo: u64,
 }
 
 #[derive(Deserialize)]
@@ -435,6 +495,7 @@ fn limits_from(rpm: u64, rpd: u64, tpm: u64, tpd: u64) -> Limits {
         rpd: known(rpd),
         tpm: known(tpm),
         tpd: known(tpd),
+        tpmo: None,
         max_input_tokens: None,
     }
 }
@@ -628,7 +689,10 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
                 });
                 ProviderLimits {
                     scope,
-                    limits: limits_from(l.rpm, l.rpd, l.tpm, l.tpd),
+                    limits: Limits {
+                        tpmo: known(l.tpmo),
+                        ..limits_from(l.rpm, l.rpd, l.tpm, l.tpd)
+                    },
                 }
             }
         };
@@ -642,6 +706,7 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
                     "{label}: model_limits entry \"{model}\" is not in the provider's models allowlist"
                 ));
             }
+            // tpmo is not a field in RawLimits (deny_unknown_fields will catch it)
             model_limits.insert(
                 model.clone(),
                 Limits {
@@ -724,6 +789,110 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
             },
         };
 
+        // ---- credit fields validation ----
+        // credit_reset_day may be set on any billing type (also sets tpmo month). Must be 1..=31.
+        let month_reset_day = match rp.credit_reset_day {
+            None => 1,
+            Some(v) => {
+                if !(1..=31).contains(&v) {
+                    problems.push(format!(
+                        "{label}: credit_reset_day = {v} must be between 1 and 31"
+                    ));
+                }
+                u8::try_from(v).unwrap_or(1)
+            }
+        };
+
+        // Validate credit-specific fields
+        let mut credit = None;
+        if billing == Billing::Credit {
+            // credit_usd must be finite and > 0
+            let usd = match rp.credit_usd {
+                Some(v) if v.is_finite() && v > 0.0 => v,
+                Some(v) => {
+                    problems.push(format!(
+                        "{label}: billing = \"credit\" needs credit_usd > 0 (got {v})"
+                    ));
+                    0.0
+                }
+                None => {
+                    problems.push(format!(
+                        "{label}: billing = \"credit\" needs credit_usd > 0"
+                    ));
+                    0.0
+                }
+            };
+
+            // credit_reset_day is required for credit billing
+            if rp.credit_reset_day.is_none() {
+                problems.push(format!(
+                    "{label}: billing = \"credit\" needs credit_reset_day (1-31)"
+                ));
+            }
+
+            // credit provider must have at least one price entry
+            if prices.is_empty() {
+                problems.push(format!(
+                    "{label}: billing = \"credit\" needs at least one [provider.prices] entry; sluice never assumes a price of zero"
+                ));
+            }
+
+            // Parse seed if provided
+            let seed = match (rp.credit_spent_usd, rp.credit_spent_date.as_deref()) {
+                (Some(spent_usd), Some(spent_date)) => {
+                    if !spent_usd.is_finite() || spent_usd < 0.0 {
+                        problems.push(format!(
+                            "{label}: credit_spent_usd = {spent_usd} must be finite and >= 0"
+                        ));
+                        None
+                    } else if let Some(day) = crate::billing::parse_date(spent_date) {
+                        Some(CreditSeed {
+                            usd: spent_usd,
+                            day,
+                        })
+                    } else {
+                        problems.push(format!(
+                            "{label}: credit_spent_date = \"{spent_date}\" must be a date YYYY-MM-DD"
+                        ));
+                        None
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    problems.push(format!(
+                        "{label}: credit_spent_usd and credit_spent_date must be set together"
+                    ));
+                    None
+                }
+                (None, None) => None,
+            };
+
+            credit = Some(Credit { usd, seed });
+        } else {
+            // credit fields on non-credit providers are errors
+            if rp.credit_usd.is_some() {
+                problems.push(format!(
+                    "{label}: credit_usd is only valid with billing = \"credit\""
+                ));
+            }
+            if rp.credit_spent_usd.is_some() {
+                problems.push(format!(
+                    "{label}: credit_spent_usd is only valid with billing = \"credit\""
+                ));
+            }
+            if rp.credit_spent_date.is_some() {
+                problems.push(format!(
+                    "{label}: credit_spent_date is only valid with billing = \"credit\""
+                ));
+            }
+        }
+
+        // usage_cost_field: when set, must be non-empty after trim
+        if let Some(ref ucf) = rp.usage_cost_field
+            && ucf.trim().is_empty()
+        {
+            problems.push(format!("{label}: usage_cost_field must not be empty"));
+        }
+
         providers.push(Provider {
             id: rp.id.clone(),
             base_url: base_url.to_string(),
@@ -739,6 +908,8 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
             model_limits,
             prices,
             usage_cost_field: rp.usage_cost_field.clone(),
+            credit,
+            month_reset_day,
         });
     }
 
@@ -1030,6 +1201,7 @@ billing = "free"
                 rpd: Some(100),
                 tpm: None,
                 tpd: None,
+                tpmo: None,
                 max_input_tokens: None
             }
         );
@@ -1040,6 +1212,7 @@ billing = "free"
                 rpd: None,
                 tpm: None,
                 tpd: None,
+                tpmo: None,
                 max_input_tokens: None
             }
         );
@@ -1434,8 +1607,8 @@ routes = ["p/m"]
 
     #[test]
     fn billing_values_parse() {
-        // free, credit and paid each parse
-        for b in ["free", "credit", "paid"] {
+        // free and paid parse with minimal config
+        for b in ["free", "paid"] {
             let text = format!(
                 r#"
 [[provider]]
@@ -1449,6 +1622,22 @@ billing = "{}"
             let c = ok(&text);
             assert_eq!(c.provider("p").unwrap().billing.name(), b);
         }
+        // credit needs additional fields
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        let c = ok(text);
+        assert_eq!(c.provider("p").unwrap().billing.name(), "credit");
+
         // billing = "gratis" gives the "must be one of" error
         let text = r#"
 [[provider]]
@@ -1513,6 +1702,241 @@ paid = false
 "#;
         let msg = err(text, "no longer means free");
         assert!(msg.contains("set billing = \"free\""));
+    }
+
+    // ---- credit and tpmo ----
+
+    #[test]
+    fn credit_provider_without_prices_refuses_to_start() {
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+"#;
+        err(text, "at least one [provider.prices] entry");
+    }
+
+    #[test]
+    fn unpriced_model_uses_the_highest_configured_price() {
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+[provider.prices."a"]
+in_per_mtok = 1.0
+out_per_mtok = 4.0
+[provider.prices."b"]
+in_per_mtok = 3.0
+out_per_mtok = 2.0
+"#;
+        let c = ok(text);
+        let p = c.provider("p").unwrap();
+        // Exact match
+        assert_eq!(
+            p.price_for("a"),
+            Some(Price {
+                in_per_mtok: 1.0,
+                out_per_mtok: 4.0
+            })
+        );
+        // Unpriced model gets highest of each component
+        assert_eq!(
+            p.price_for("zzz"),
+            Some(Price {
+                in_per_mtok: 3.0,
+                out_per_mtok: 4.0
+            })
+        );
+        // Provider with no prices returns None
+        let text_no_prices = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "free"
+"#;
+        let c2 = ok(text_no_prices);
+        let p2 = c2.provider("p").unwrap();
+        assert_eq!(p2.price_for("any"), None);
+    }
+
+    #[test]
+    fn credit_fields_are_validated() {
+        // Missing credit_usd
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_reset_day = 1
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        err(text, "needs credit_usd > 0");
+
+        // credit_usd = 0
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 0
+credit_reset_day = 1
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        err(text, "needs credit_usd > 0");
+
+        // reset day 0
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 0
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        err(text, "credit_reset_day = 0 must be between 1 and 31");
+
+        // reset day 32
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 32
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        err(text, "credit_reset_day = 32 must be between 1 and 31");
+
+        // credit_usd on a free provider
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "free"
+credit_usd = 10.0
+"#;
+        err(text, "credit_usd is only valid with billing = \"credit\"");
+
+        // spent amount without date
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+credit_spent_usd = 5.0
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        err(
+            text,
+            "credit_spent_usd and credit_spent_date must be set together",
+        );
+
+        // bad date
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 1
+credit_spent_usd = 5.0
+credit_spent_date = "not-a-date"
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        err(
+            text,
+            "credit_spent_date = \"not-a-date\" must be a date YYYY-MM-DD",
+        );
+
+        // Valid credit provider
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "credit"
+credit_usd = 10.0
+credit_reset_day = 5
+credit_spent_usd = 10.0
+credit_spent_date = "2026-11-18"
+[provider.prices."m"]
+in_per_mtok = 1.0
+out_per_mtok = 1.0
+"#;
+        let c = ok(text);
+        let p = c.provider("p").unwrap();
+        assert_eq!(
+            p.credit,
+            Some(Credit {
+                usd: 10.0,
+                seed: Some(CreditSeed {
+                    usd: 10.0,
+                    day: 20775
+                })
+            })
+        );
+        assert_eq!(p.month_reset_day, 5);
+    }
+
+    #[test]
+    fn tpmo_parses_and_month_day_defaults_to_first() {
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "free"
+[provider.limits]
+tpmo = 3000000
+"#;
+        let c = ok(text);
+        let p = c.provider("p").unwrap();
+        assert_eq!(p.limits.limits.tpmo, Some(3_000_000));
+        assert_eq!(p.month_reset_day, 1);
+
+        // tpmo under model_limits is rejected by deny_unknown_fields
+        let text = r#"
+[[provider]]
+id = "p"
+base_url = "https://p.example/v1"
+keys_env = "A_KEYS"
+billing = "free"
+models = ["m"]
+[provider.model_limits."m"]
+tpmo = 1000
+"#;
+        err(text, "unknown field `tpmo`");
     }
 
     // ---- limits scope ----

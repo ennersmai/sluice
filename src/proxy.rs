@@ -136,7 +136,8 @@ enum Class {
     /// This request is too big for the route (pool only): fail over with
     /// no cooldown and no breaker count.
     TooLarge,
-    /// HTTP 5xx: counts toward the route's breaker.
+    /// HTTP 5xx, first-byte timeout or idle timeout (all model-specific):
+    /// counts toward the route's breaker.
     ServerError,
     /// Connect error, timeout or broken body: counts toward the provider's
     /// breaker.
@@ -280,6 +281,7 @@ async fn forward(
 
     let max_attempts = state.config.max_attempts.max(1);
     let first_byte_timeout = Duration::from_secs(state.config.first_byte_timeout_secs);
+    let stream_idle_timeout = Duration::from_secs(state.config.stream_idle_timeout_secs);
     let mut attempts: u32 = 0;
     let mut first_overhead: Option<Duration> = None;
     let mut last: Option<LastError> = None;
@@ -319,27 +321,38 @@ async fn forward(
             .note_request(provider, entry.key_idx, entry.model, Instant::now());
         let overhead = *first_overhead.get_or_insert_with(|| started.elapsed());
 
+        // The first-byte deadline covers the request, the response headers
+        // and (for 2xx) the first non-empty body chunk, all measured from
+        // here. Nothing reaches the client before that chunk arrives, so a
+        // stall at any of those points can still fail over.
+        let deadline = tokio::time::Instant::now() + first_byte_timeout;
         let send = state
             .http
             .post(url)
             .headers(upstream_headers)
             .body(outgoing)
             .send();
-        let upstream = match tokio::time::timeout(first_byte_timeout, send).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => {
-                track.attempt(provider, entry.model, key, "unreachable", attempt_start);
-                apply_failure(state, entry, Class::Unreachable, None, "unreachable");
-                continue;
-            }
-            Err(_) => {
-                track.attempt(provider, entry.model, key, "timeout", attempt_start);
-                apply_failure(state, entry, Class::Unreachable, None, "timeout");
-                continue;
-            }
-        };
+        let (mut upstream, first_chunk) =
+            match tokio::time::timeout_at(deadline, await_first_byte(send)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(FirstByteError::Send)) => {
+                    track.attempt(provider, entry.model, key, "unreachable", attempt_start);
+                    apply_failure(state, entry, Class::Unreachable, None, "unreachable");
+                    continue;
+                }
+                Ok(Err(FirstByteError::Body)) => {
+                    track.attempt(provider, entry.model, key, "body_error", attempt_start);
+                    apply_failure(state, entry, Class::Unreachable, None, "body_error");
+                    continue;
+                }
+                Err(_) => {
+                    track.attempt(provider, entry.model, key, "timeout", attempt_start);
+                    apply_failure(state, entry, Class::ServerError, None, "timeout");
+                    continue;
+                }
+            };
 
-        let headers_elapsed = attempt_start.elapsed();
+        let first_elapsed = attempt_start.elapsed();
         let status = upstream.status();
         let class = classify(status, is_pool);
         if is_pool && class == Class::Passthrough && matches!(status.as_u16(), 400 | 422) {
@@ -427,15 +440,32 @@ async fn forward(
                 track.end(status.as_u16(), None, Usage::default());
                 None
             };
-            let first = (class == Class::Success).then(|| (Arc::clone(&track), attempt_start));
-            Body::from_stream(guarded_stream(state, entry, upstream, tap, first))
+            if class == Class::Success {
+                track.first_byte(first_elapsed);
+            }
+            Body::from_stream(guarded_stream(
+                state,
+                entry,
+                upstream,
+                first_chunk,
+                tap,
+                stream_idle_timeout,
+            ))
         } else {
-            match upstream.bytes().await {
+            let mut buf: Vec<u8> = first_chunk.map(|c| c.to_vec()).unwrap_or_default();
+            let read = loop {
+                match next_chunk(&mut upstream, stream_idle_timeout).await {
+                    Ok(Some(c)) => buf.extend_from_slice(&c),
+                    Ok(None) => break Ok(Bytes::from(buf)),
+                    Err(e) => break Err(e),
+                }
+            };
+            match read {
                 Ok(bytes) => {
                     if class == Class::Success {
                         state.limiter.record_success(&scope, entry.model);
                         track.attempt(provider, entry.model, key, "ok", attempt_start);
-                        track.first_byte(headers_elapsed);
+                        track.first_byte(first_elapsed);
                         let mut settle =
                             Settle::new(state, entry, prompt_estimate, hints, &track, status);
                         settle.usage = usage_from_body(&bytes);
@@ -456,13 +486,28 @@ async fn forward(
                     }
                     Body::from(bytes)
                 }
-                Err(_) if class == Class::Success => {
+                Err(ChunkError::Idle) => {
+                    track.attempt(provider, entry.model, key, "idle_timeout", attempt_start);
+                    if class == Class::Success {
+                        apply_failure(state, entry, Class::ServerError, None, "idle_timeout");
+                    }
+                    return Err(ApiError::new(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "upstream_error",
+                        "idle_timeout",
+                        format!(
+                            "provider \"{}\" stopped sending the response body",
+                            provider.id
+                        ),
+                    ));
+                }
+                Err(ChunkError::Body) if class == Class::Success => {
                     // Nothing has reached the client yet, so this can fail over.
                     track.attempt(provider, entry.model, key, "body_error", attempt_start);
                     apply_failure(state, entry, Class::Unreachable, None, "body_error");
                     continue;
                 }
-                Err(_) => {
+                Err(ChunkError::Body) => {
                     track.attempt(provider, entry.model, key, "body_error", attempt_start);
                     return Err(upstream_unreachable(&provider.id));
                 }
@@ -535,6 +580,50 @@ async fn read_capped(mut response: reqwest::Response) -> Bytes {
         }
     }
     Bytes::from(buf)
+}
+
+enum FirstByteError {
+    Send,
+    Body,
+}
+
+/// Send the request and, for a 2xx response, wait for the first non-empty
+/// body chunk (SSE comment keep-alives count as bytes). Other statuses
+/// return as soon as the headers arrive. Run under the first-byte deadline.
+async fn await_first_byte(
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+) -> Result<(reqwest::Response, Option<Bytes>), FirstByteError> {
+    let mut response = send.await.map_err(|_| FirstByteError::Send)?;
+    if !response.status().is_success() {
+        return Ok((response, None));
+    }
+    loop {
+        match response.chunk().await {
+            Ok(Some(c)) if c.is_empty() => {}
+            Ok(Some(c)) => return Ok((response, Some(c))),
+            Ok(None) => return Ok((response, None)),
+            Err(_) => return Err(FirstByteError::Body),
+        }
+    }
+}
+
+enum ChunkError {
+    Idle,
+    Body,
+}
+
+/// Next body chunk, failing when none arrives within `idle` (0 disables).
+async fn next_chunk(
+    response: &mut reqwest::Response,
+    idle: Duration,
+) -> Result<Option<Bytes>, ChunkError> {
+    if idle.is_zero() {
+        return response.chunk().await.map_err(|_| ChunkError::Body);
+    }
+    match tokio::time::timeout(idle, response.chunk()).await {
+        Ok(r) => r.map_err(|_| ChunkError::Body),
+        Err(_) => Err(ChunkError::Idle),
+    }
 }
 
 /// Record a retryable failure in the limiter and log the warnings.
@@ -643,8 +732,9 @@ fn guarded_stream(
     state: &Arc<AppState>,
     entry: &Entry<'_>,
     upstream: reqwest::Response,
+    first_chunk: Option<Bytes>,
     tap: Option<Tap>,
-    first_byte: Option<(Arc<ReqTrack>, Instant)>,
+    idle: Duration,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> + use<> {
     let provider = entry.provider.id.clone();
     let error_event = Bytes::from(format!(
@@ -657,34 +747,75 @@ fn guarded_stream(
         )
         .body()
     ));
+    let idle_event = Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_error",
+            "idle_timeout",
+            format!("provider \"{provider}\" stopped sending data (idle_timeout)"),
+        )
+        .body()
+    ));
+    let inner = futures_util::stream::iter(first_chunk.map(Ok)).chain(upstream.bytes_stream());
     let seed = StreamState {
-        inner: Box::pin(upstream.bytes_stream()),
+        inner: Box::pin(inner),
         tap,
-        first_byte,
         done: false,
         state: Arc::clone(state),
         provider,
+        model: entry.model.to_string(),
+        idle,
         error_event,
+        idle_event,
     };
     futures_util::stream::unfold(seed, |mut st| async move {
         if st.done {
             return None;
         }
         loop {
-            match st.inner.next().await {
-                Some(Ok(bytes)) => {
-                    if let Some((track, since)) = st.first_byte.take() {
-                        track.first_byte(since.elapsed());
-                    }
-                    match st.tap.as_mut() {
-                        Some(tap) => {
-                            if let Some(out) = tap.push(bytes) {
-                                return Some((Ok(out), st));
-                            }
-                        }
-                        None => return Some((Ok(bytes), st)),
+            let next = if st.idle.is_zero() {
+                Some(st.inner.next().await)
+            } else {
+                tokio::time::timeout(st.idle, st.inner.next()).await.ok()
+            };
+            let Some(next) = next else {
+                st.done = true;
+                if let Some(tap) = st.tap.as_mut() {
+                    tap.settle.failed = true;
+                    st.state
+                        .events
+                        .note_error(&st.provider, Some(&st.model), "idle_timeout");
+                    if st.state.limiter.record_route_failure(
+                        &st.provider,
+                        &st.model,
+                        Instant::now(),
+                    ) {
+                        crate::elog!(
+                            "warn: circuit breaker open provider={} model={} for {}s (idle timeout)",
+                            st.provider,
+                            st.model,
+                            limiter::BREAKER_OPEN.as_secs()
+                        );
                     }
                 }
+                crate::elog!(
+                    "warn: stream idle timeout provider={} model={}",
+                    st.provider,
+                    st.model
+                );
+                let event = st.idle_event.clone();
+                return Some((Ok(event), st));
+            };
+            match next {
+                Some(Ok(bytes)) => match st.tap.as_mut() {
+                    Some(tap) => {
+                        if let Some(out) = tap.push(bytes) {
+                            return Some((Ok(out), st));
+                        }
+                    }
+                    None => return Some((Ok(bytes), st)),
+                },
                 Some(Err(_)) => {
                     st.done = true;
                     if let Some(tap) = st.tap.as_mut() {
@@ -724,13 +855,13 @@ fn guarded_stream(
 struct StreamState {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     tap: Option<Tap>,
-    /// The request and when the serving attempt began, until the first
-    /// upstream byte arrives.
-    first_byte: Option<(Arc<ReqTrack>, Instant)>,
     done: bool,
     state: Arc<AppState>,
     provider: String,
+    model: String,
+    idle: Duration,
     error_event: Bytes,
+    idle_event: Bytes,
 }
 
 /// Usage of one response, recorded in the limiter when dropped, so it is

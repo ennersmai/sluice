@@ -92,6 +92,8 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     pub max_attempts: u32,
     pub first_byte_timeout_secs: u64,
+    /// Silence allowed once the body has started; 0 disables.
+    pub stream_idle_timeout_secs: u64,
     pub max_wait_secs: u64,
     pub private_default: bool,
     pub paid_daily_cap_usd: f64,
@@ -277,6 +279,9 @@ fn default_max_attempts() -> u32 {
 fn default_first_byte_timeout_secs() -> u64 {
     20
 }
+fn default_stream_idle_timeout_secs() -> u64 {
+    60
+}
 fn default_max_wait_secs() -> u64 {
     15
 }
@@ -300,6 +305,8 @@ struct RawConfig {
     max_attempts: u32,
     #[serde(default = "default_first_byte_timeout_secs")]
     first_byte_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    stream_idle_timeout_secs: u64,
     #[serde(default = "default_max_wait_secs")]
     max_wait_secs: u64,
     #[serde(default)]
@@ -735,6 +742,7 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
             .map(PathBuf::from),
         max_attempts: raw.max_attempts,
         first_byte_timeout_secs: raw.first_byte_timeout_secs,
+        stream_idle_timeout_secs: raw.stream_idle_timeout_secs,
         max_wait_secs: raw.max_wait_secs,
         private_default: raw.private_default,
         paid_daily_cap_usd: raw.paid_daily_cap_usd,

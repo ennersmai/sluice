@@ -13,7 +13,7 @@ Restart to apply config changes; startup is near instant and counters and long c
 
 ## Config reference (`router.toml`)
 
-Top level: `bind` (default `127.0.0.1:8787`; any non-loopback address requires `ROUTER_API_KEY` in `.env`, checked as a bearer token on every path), `state_file`, `log_file` (optional; also append every request line and warning to this file), `max_attempts`, `first_byte_timeout_secs`, `max_wait_secs` (hold a request this long if a route frees up soon, 0 disables), `private_default`, `paid_daily_cap_usd`.
+Top level: `bind` (default `127.0.0.1:8787`; any non-loopback address requires `ROUTER_API_KEY` in `.env`, checked as a bearer token on every path), `state_file`, `log_file` (optional; also append every request line and warning to this file), `max_attempts`, `first_byte_timeout_secs` (time from sending the request until the first non-empty body chunk of a 2xx response, not just the headers; nothing is sent to the client before then, so a stall fails over to the next route and counts toward that route's breaker), `stream_idle_timeout_secs` (default 60, 0 disables: once the body has started, this much silence ends a stream with an SSE `error` event with code `idle_timeout`, or gives a non-streaming request a 504; also counts toward the route's breaker), `max_wait_secs` (hold a request this long if a route frees up soon, 0 disables), `private_default`, `paid_daily_cap_usd`.
 
 Each `[[provider]]`:
 

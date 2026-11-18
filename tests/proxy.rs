@@ -922,6 +922,76 @@ async fn t6_first_byte_timeout_fails_over() {
     assert_eq!(r.bytes().await.unwrap(), "{\"fast\":true}");
 }
 
+/// Headers (200 + SSE) go out at once but the first body chunk is 4 s late:
+/// still a first-byte timeout, so the client gets the second route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t6_headers_then_stalled_body_fails_over() {
+    let alpha = Mock::start(Reply::Stream(vec![(
+        Duration::from_secs(4),
+        SSE_CHUNK.to_vec(),
+    )]))
+    .await;
+    let beta = Mock::start(Reply::Stream(vec![(
+        Duration::from_millis(10),
+        b"data: {\"from\":\"beta\"}\n\n".to_vec(),
+    )]))
+    .await;
+    let router = start_router(config_full(
+        "first_byte_timeout_secs = 1",
+        &alpha.base_url(),
+        &beta.base_url(),
+        "",
+        ALPHA_KEY,
+    ))
+    .await;
+
+    let started = Instant::now();
+    let r = post_json(
+        router,
+        &json!({"model": "coder", "stream": true, "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(r.text().await.unwrap().contains("\"from\":\"beta\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_idle_timeout_emits_error_event_and_closes() {
+    let alpha = Mock::start(Reply::Stream(vec![
+        (Duration::from_millis(10), SSE_CHUNK.to_vec()),
+        (Duration::from_secs(10), b"data: late\n\n".to_vec()),
+    ]))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config_full(
+        "stream_idle_timeout_secs = 1",
+        &alpha.base_url(),
+        &beta.base_url(),
+        "",
+        ALPHA_KEY,
+    ))
+    .await;
+
+    let started = Instant::now();
+    let r = post_json(
+        router,
+        &json!({"model": "coder", "stream": true, "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(text.starts_with(std::str::from_utf8(SSE_CHUNK).unwrap()));
+    let (_, tail) = text.split_once("event: error\ndata: ").expect(&text);
+    let data: Value = serde_json::from_str(tail.trim_end()).unwrap();
+    assert_eq!(data["error"]["code"], "idle_timeout");
+    assert!(!text.contains("late"));
+    assert!(beta.calls().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t7_mid_stream_drop_emits_sse_error_event_and_does_not_retry() {
     let alpha = Mock::start(Reply::StreamThenAbort(vec![(

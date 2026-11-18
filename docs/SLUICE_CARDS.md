@@ -77,6 +77,7 @@ Do not: add a date crate such as chrono or time. Do not touch limiter.rs or even
 ---
 
 ID: SL-03
+> **Supervisor note:** SL-01 already added the parsed field `usage_cost_field: Option<String>` to `Provider` and `RawProvider` (parsing only, nothing reads it yet). Keep it as it is; do not add it a second time.
 
 Goal: Add config fields for credit providers, monthly token limits and provider-reported cost, plus the price fallback. A credit provider without prices refuses to start. Never assume a price of zero.
 

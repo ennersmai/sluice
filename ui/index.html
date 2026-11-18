@@ -9,6 +9,19 @@
   --bg:#0c0f13;--surface:#13181f;--surface2:#1a212a;--line:#242c37;--line2:#323c4a;
   --fg:#d9e0e8;--dim:#8794a4;--faint:#5c6877;
   --ok:#3ecf7a;--cooling:#e6a935;--bad:#ef5b53;--paused:#7a8594;--missing:#b47ae6;--info:#5aa2f0;
+  /* Provider series colours (no status red/amber/green) */
+  --prov-0:#5aa2f0;  /* blue */
+  --prov-1:#a78bfa;  /* violet */
+  --prov-2:#f472b6;  /* pink */
+  --prov-3:#2dd4bf;  /* teal */
+  --prov-4:#f97316;  /* orange-brown (muted, not status amber) */
+  --prov-5:#60a5fa;  /* light blue */
+  --prov-6:#c084fc;  /* purple */
+  --prov-7:#fda4af;  /* light pink */
+  --prov-8:#5eead4;  /* cyan */
+  --prov-9:#94a3b8;  /* slate */
+  --prov-10:#a3e635; /* lime-green (muted, not status green) */
+  --prov-11:#d97706; /* amber-brown (muted, not status amber) */
   --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--r:6px;
   --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
 }
@@ -50,6 +63,8 @@ input:focus{outline:1px solid var(--info);border-color:var(--info)}
 .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--c,var(--line2));color:var(--c,var(--dim));white-space:nowrap}
 .pill:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--c,var(--dim))}
 .tag{font-size:10px;padding:0 6px;border-radius:3px;border:1px solid var(--line2);color:var(--dim);white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
+.tag.credit{color:var(--info);border-color:var(--info)}
+.tag.free{color:var(--ok);border-color:var(--ok)}
 .tag.paid{color:var(--cooling);border-color:var(--cooling)}
 .tag.next{color:var(--ok);border-color:var(--ok)}
 .chip{display:inline-block;margin:1px 4px 1px 0;padding:0 8px;border-radius:9px;border:1px solid var(--line2);font-size:12px;white-space:nowrap}
@@ -213,10 +228,22 @@ var S = null;            // last /status snapshot, merged with counters events
 var statusAt = 0;        // performance.now() when S.uptime_secs was current
 var recent = [];         // request records, newest first
 var byId = {};
-var colors = ['#6ea8fe', '#4dd0c4', '#f28fad', '#d6b94f', '#9b8cf0', '#7fc97f', '#e0916a', '#8fb4c9'];
+var colors = ['var(--prov-0)', 'var(--prov-1)', 'var(--prov-2)', 'var(--prov-3)', 'var(--prov-4)', 'var(--prov-5)', 'var(--prov-6)', 'var(--prov-7)', 'var(--prov-8)', 'var(--prov-9)', 'var(--prov-10)', 'var(--prov-11)'];
 var colorOf = {};
 var lastEventAt = 0;
 var connected = false;
+
+// Live routing expansion state
+var liveExpanded = false;
+var LIVE_COLLAPSED_VISIBLE = 10;
+
+// ---- localStorage helpers with try/catch ----
+function lsGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function lsSet(key, val) {
+  try { localStorage.setItem(key, val); } catch (e) { }
+}
 
 // ---- tickers: spans carry absolute deadlines / timestamps ----
 function cdSpan() { var s = el('span', 'cd'); s.hidden = true; return s; }
@@ -264,7 +291,8 @@ var tiles = {};
 function mkTiles() {
   var box = $('tiles');
   [['req', 'requests today'], ['in', 'tokens in today'], ['out', 'tokens out today'], ['streams', 'active streams'],
-   ['succ', 'success, last 200'], ['fo', 'failovers, last 200'], ['paid', 'paid spend / cap']].forEach(function (t) {
+   ['succ', 'success, last 200'], ['fo', 'failovers, last 200'], ['paid', 'paid spend / cap'],
+   ['spend', 'est. spend today'], ['sticky', 'sticky sessions']].forEach(function (t) {
     var d = el('div', 'tile'), v = el('div', 'v', '-'), sub = el('div', 'sub');
     add(d, el('div', 'l', t[1]), v, sub);
     box.appendChild(d);
@@ -294,6 +322,8 @@ function renderSummary() {
   var cap = Number(pd.cap_usd) || 0, sp = Number(pd.spend_usd) || 0;
   setTile('paid', fmtUsd(sp) + ' / ' + fmtUsd(cap), cap ? Math.round(sp / cap * 100) + '% of cap' : 'paid routes off',
     cap && sp >= cap ? 'bad' : cap && sp >= cap * 0.8 ? 'warn' : '');
+  setTile('spend', fmtUsd(S.spend_today_usd || 0), 'all providers, estimate');
+  setTile('sticky', String(S.sticky_sessions || 0), 'idle 2 h expiry');
   $('h-act').textContent = String(S.active_requests);
   $('h-up').textContent = fmtDur(S.uptime_secs + (performance.now() - statusAt) / 1000);
   if (S.version) $('h-ver').textContent = 'v' + S.version;
@@ -364,7 +394,8 @@ function renderPools() {
 // ---- provider cards (built once, updated in place) ----
 var cards = {};
 var BARS = [['rpm', 'requests_minute', 'req / min'], ['rpd', 'requests_day', 'req / day'],
-            ['tpm', 'tokens_minute', 'tokens / min'], ['tpd', 'tokens_day', 'tokens / day']];
+            ['tpm', 'tokens_minute', 'tokens / min'], ['tpd', 'tokens_day', 'tokens / day'],
+            ['tpmo', 'tokens_month', 'tokens / month']];
 function mkBar(label) {
   var b = el('div', 'bar'), l = el('div', 'lbl'), t = el('div', 'track'), f = el('div', 'fill');
   b.val = el('b');
@@ -443,6 +474,7 @@ function mkCard(p) {
   c.pause = el('button', null, 'Pause');
   c.clear = el('button', null, 'Clear cooldown');
   c.ceil = el('button', null, 'Clear ceilings');
+  c.pay = el('button', null, 'Clear 402');
   c.tog = el('button', null, 'Models');
   c.fb = el('span', 'fb');
   c.pause.onclick = function () {
@@ -459,8 +491,12 @@ function mkCard(p) {
     admin(c, c.ceil, '/admin/ceilings/clear?provider=' + encodeURIComponent(p.id), function () { return 'Clear ceilings'; },
       function (j) { return j.cleared ? 'cleared ' + j.cleared + (j.cleared === 1 ? ' ceiling' : ' ceilings') : 'no ceilings'; });
   };
+  c.pay.onclick = function () {
+    admin(c, c.pay, '/admin/provider/' + encodeURIComponent(p.id) + '/payment/clear', function () { return 'Clear 402'; },
+      function (j) { return j.cleared ? 'cleared' : 'nothing to clear'; });
+  };
   c.tog.onclick = function () { c.open = !c.open; updateCard(c, findProv(p.id)); };
-  add(btns, c.pause, c.clear, c.ceil, c.tog, c.fb);
+  add(btns, c.pause, c.clear, c.ceil, c.pay, c.tog, c.fb);
   c.models = el('table', 'models');
   c.models.hidden = true;
   var th = el('thead'), hr = el('tr');
@@ -483,7 +519,9 @@ function updateCard(c, p) {
   setPill(c.pill, p.state, p._until);
   var kd = (p.disabled_keys || []).length;
   c.tags.textContent = '';
-  if (p.paid) c.tags.appendChild(el('span', 'tag paid', 'paid'));
+  if (p.billing === 'credit') c.tags.appendChild(el('span', 'tag credit', 'credit'));
+  else if (p.billing === 'free') c.tags.appendChild(el('span', 'tag free', 'free'));
+  else if (p.paid) c.tags.appendChild(el('span', 'tag paid', 'paid'));
   if (p.trains_on_input) c.tags.appendChild(el('span', 'tag', 'trains on input'));
   c.tags.appendChild(el('span', 'tag', p.keys + (p.keys === 1 ? ' key' : ' keys') + (kd ? ', ' + kd + ' off' : '')));
   var lim = p.limits || {};
@@ -500,6 +538,15 @@ function updateCard(c, p) {
   (p.cooldowns || []).forEach(function (k) {
     note(c.notes, k.scope + ' cooldown' + (k.model ? ' ' + k.model : '') + (k.key ? ' ' + k.key : ''), '', k._until);
   });
+  if (p.payment_required) {
+    note(c.notes, '402 payment required: provider disabled until cleared', '', null);
+  }
+  if (p.credit && p.credit.exhausted) {
+    note(c.notes, 'credit: ' + fmtUsd(p.credit.spent_usd) + ' of ' + fmtUsd(p.credit.usd) + ' (stops at ' + fmtUsd(p.credit.guard_usd) + '), resets ' + new Date(p.credit.resets_at_ms).toLocaleDateString(), 'p', p.credit.resets_at_ms);
+  } else if (p.credit) {
+    note(c.notes, 'credit: ' + fmtUsd(p.credit.spent_usd) + ' of ' + fmtUsd(p.credit.usd) + ' (stops at ' + fmtUsd(p.credit.guard_usd) + '), resets ' + new Date(p.credit.resets_at_ms).toLocaleDateString(), '');
+  }
+  note(c.notes, 'spend today ' + fmtUsd(p.spend_today_usd || 0), '');
   if (p.last_error) {
     c.err.hidden = false;
     c.errText.nodeValue = 'last error: ' + lastErrText(p.last_error) + ' - ';
@@ -508,6 +555,7 @@ function updateCard(c, p) {
     c.err.title = fmtFull(p.last_error.time_ms);
   } else c.err.hidden = true;
   if (!c.pause.disabled) c.pause.textContent = p.state === 'paused' ? 'Resume' : 'Pause';
+  c.pay.hidden = !p.payment_required;
   var n = (p.models || []).length;
   c.tog.textContent = (c.open ? 'Hide' : 'Show') + ' models (' + n + ')';
   c.models.hidden = !(c.open && n);
@@ -652,7 +700,23 @@ function fillRow(ref, r) {
 }
 function renderLive() {
   var body = $('lbody');
-  var rows = recent.filter(matches).slice(0, 100), keep = {};
+  var matched = recent.filter(matches);
+  var inFlight = matched.filter(function (r) { return r.in_flight; });
+  var finished = matched.filter(function (r) { return !r.in_flight; });
+  var rows;
+  var showExpandBtn = false;
+  var hiddenCount = 0;
+  if (liveExpanded) {
+    rows = inFlight.concat(finished);
+  } else {
+    var visibleFinished = finished.slice(0, LIVE_COLLAPSED_VISIBLE);
+    rows = inFlight.concat(visibleFinished);
+    if (finished.length > LIVE_COLLAPSED_VISIBLE) {
+      showExpandBtn = true;
+      hiddenCount = finished.length - LIVE_COLLAPSED_VISIBLE;
+    }
+  }
+  var keep = {};
   rows.forEach(function (r) { keep[r.id] = true; });
   Object.keys(rowRefs).forEach(function (id) {
     if (!keep[id]) { rowRefs[id].tr.remove(); rowRefs[id].dt.remove(); delete rowRefs[id]; }
@@ -665,6 +729,26 @@ function renderLive() {
       body.insertBefore(ref.dt, ref.tr.nextSibling);
     }
   });
+  // Expand/collapse button
+  var btnBox = $('fbtns');
+  var expandBtn = $('live-expand-btn');
+  if (showExpandBtn) {
+    if (!expandBtn) {
+      expandBtn = el('button', null, 'Show ' + hiddenCount + ' more');
+      expandBtn.id = 'live-expand-btn';
+      expandBtn.style.marginRight = '8px';
+      expandBtn.onclick = function () {
+        liveExpanded = !liveExpanded;
+        lsSet('sluice_live_expanded', liveExpanded ? '1' : '0');
+        renderLive();
+      };
+      btnBox.insertBefore(expandBtn, btnBox.firstChild);
+    } else {
+      expandBtn.textContent = liveExpanded ? 'Show fewer' : 'Show ' + hiddenCount + ' more';
+    }
+  } else if (expandBtn) {
+    expandBtn.remove();
+  }
   $('ltable').hidden = !rows.length;
   var e = $('lempty');
   e.hidden = !!rows.length;
@@ -785,6 +869,9 @@ function applyStatus(j) {
   recent = (j.recent || []).slice();
   byId = {};
   recent.forEach(function (r) { byId[r.id] = r; });
+  // Restore live expanded state from localStorage
+  var stored = lsGet('sluice_live_expanded');
+  if (stored !== null) liveExpanded = stored === '1';
   renderProviders();
   renderPools();
   renderLive();

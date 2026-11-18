@@ -106,3 +106,42 @@ Mistral prices (USD per million tokens, input / output), from docs.mistral.ai/in
 - **Fix:** SL-10 (log a bounded error-body excerpt), SL-11 (a PerDay quota cools the route until the next daily reset; Gemini resets at midnight Pacific, reset_utc_hour = 8), SL-12 (session stickiness, so a session started on Gemini stays there). Published free-tier limits: Google publishes none for these models; a third-party AI Studio reading (2026-10-21) gives 20 RPD for gemini-3.8-flash, 3.6-flash and 3-flash-preview. Nothing found for gemini-4-hydrogen.
 
 ---
+
+## SL-16: Dashboard fixes – live routing truncation and provider colours (completed 2026-11-19)
+
+### Files changed
+- ui/index.html: Two independent dashboard improvements
+
+### Change 1: Live routing panel shows 10 most recent + toggle
+- In-flight requests always shown at top
+- When collapsed: in-flight + 10 most recent finished rows that pass current filters
+- "Show N more" button appears when more finished rows exist (N = hidden count)
+- Clicking expands to full list (up to 200 kept in memory); button becomes "Show fewer"
+- In collapsed mode, oldest visible finished row drops off as new ones arrive (rolling window)
+- Expanded/collapsed choice survives re-renders and is stored in localStorage (all accesses wrapped in try/catch)
+- Filter buttons (All / Errors only / Failovers only) and search filter still work in both modes
+
+### Change 2: Provider colours avoid status colours
+- Old palette had 8 colours including status-like hues (green, amber, red-ish)
+- New palette: 12 distinct hues defined as CSS custom properties `--prov-0` through `--prov-11`
+- Colours used: blues, indigos, violets, purples, magentas, pinks, teals, cyans, slates, browns
+- No reds, oranges, ambers, yellows, or greens that could be confused with status (ok/cooling/bad/paused/missing)
+- Assigned by provider's index in config order (stable across reloads)
+- Used for: chart bars, legend swatches, card left-border swatches, sparklines
+- Status colours (--ok, --cooling, --bad, --paused, --missing) unchanged and used only for status
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 109 unit + 5 main + 1 bench + 2 dashboard + 4 health + 46 proxy = 167 tests PASS
+- T25 dashboard tests pass: no external URLs, file size 45,620 bytes (< 60 KB)
+- `grep -c "Show fewer" ui/index.html` → 1 (matches requirement ≥ 1)
+
+### Verification
+- File size: 45,620 bytes (under 61,440 limit)
+- No http:// or https:// URLs in the file
+- All 167 tests pass
+- localStorage persistence tested manually: expand state survives page reload
+- Colour palette verified: 12 distinct non-status hues assigned by config order
+
+---

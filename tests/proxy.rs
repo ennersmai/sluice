@@ -1252,6 +1252,36 @@ async fn content_shape_400_fails_over_and_learns_no_ceiling() {
     assert!(status["providers"][0]["models"][0]["ceiling_tokens"].is_null());
 }
 
+/// A provider answered 200 and then streamed an error as its first event
+/// ("invalid tool generation", Cohere, 2026-11-18). Nothing has reached the
+/// client yet, so the request must fail over instead of forwarding the error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_opening_with_an_error_event_fails_over() {
+    let alpha = Mock::start(Reply::Stream(vec![(
+        Duration::from_millis(10),
+        b"data: {\"error\":{\"message\":\"your request resulted in an invalid tool generation\"}}\n\n"
+            .to_vec(),
+    )]))
+    .await;
+    let beta = Mock::start(Reply::Stream(vec![(
+        Duration::from_millis(10),
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_vec(),
+    )]))
+    .await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let r = post_json(
+        router,
+        &json!({"model": "coder", "stream": true, "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    let body = r.text().await.unwrap();
+    assert!(body.contains("\"ok\""), "{body}");
+    assert!(!body.contains("invalid tool generation"), "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_max_input_tokens_skips_from_the_first_request() {
     let beta = Mock::start(Reply::json(200, "{}")).await;

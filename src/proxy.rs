@@ -364,6 +364,13 @@ async fn forward(
                     apply_failure(state, entry, Class::Unreachable, None, "body_error", None);
                     continue;
                 }
+                Ok(Err(FirstByteError::StreamError)) => {
+                    // A model-level failure on this route: count it toward the
+                    // route's breaker and try the next candidate.
+                    track.attempt(provider, entry.model, key, "stream_error", attempt_start);
+                    apply_failure(state, entry, Class::ServerError, None, "stream_error", None);
+                    continue;
+                }
                 Err(_) => {
                     track.attempt(provider, entry.model, key, "timeout", attempt_start);
                     apply_failure(state, entry, Class::ServerError, None, "timeout", None);
@@ -692,6 +699,56 @@ async fn read_capped(mut response: reqwest::Response) -> Bytes {
 enum FirstByteError {
     Send,
     Body,
+    /// A 2xx stream whose first event is an error (for example a provider
+    /// streaming `{"error": ...}` after a malformed tool call). Nothing has
+    /// reached the client yet, so the request can still fail over.
+    StreamError,
+}
+
+/// Bytes read past the first data line while checking it, at most.
+const FIRST_LINE_LIMIT: usize = 64 * 1024;
+
+/// True when the first non-empty, non-comment SSE line in `bytes` is complete.
+fn first_data_line_complete(bytes: &[u8]) -> bool {
+    first_data_line(bytes).is_some_and(|(_, complete)| complete)
+}
+
+/// The first line that is neither empty nor an SSE comment, and whether it
+/// ends with a newline.
+fn first_data_line(bytes: &[u8]) -> Option<(&[u8], bool)> {
+    let mut rest = bytes;
+    loop {
+        let (line, complete, next) = match rest.iter().position(|&b| b == b'\n') {
+            Some(i) => (&rest[..i], true, &rest[i + 1..]),
+            None => (rest, false, &rest[rest.len()..]),
+        };
+        let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
+        if !trimmed.is_empty() && !trimmed.starts_with(b":") {
+            return Some((trimmed, complete));
+        }
+        if !complete {
+            return None;
+        }
+        rest = next;
+    }
+}
+
+/// True when a stream opens with an error event instead of content:
+/// `event: error`, or `data:` carrying a JSON object with a top-level `error`.
+fn opens_with_error(bytes: &[u8]) -> bool {
+    let Some((line, _)) = first_data_line(bytes) else {
+        return false;
+    };
+    if line.starts_with(b"event:") {
+        return line[6..].trim_ascii() == b"error";
+    }
+    let Some(payload) = line.strip_prefix(b"data:") else {
+        return false;
+    };
+    serde_json::from_slice::<Value>(payload.trim_ascii())
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("error")))
+        .unwrap_or(false)
 }
 
 /// Send the request and, for a 2xx response, wait for the first non-empty
@@ -708,16 +765,28 @@ async fn await_first_byte(
     // together with the first real chunk; they do not stop the deadline.
     let mut held: Vec<u8> = Vec::new();
     let mut scan = LineScan::default();
+    let mut data_started = false;
     loop {
         match response.chunk().await {
             Ok(Some(c)) => {
-                let data = scan.feed(&c);
+                data_started |= scan.feed(&c);
                 held.extend_from_slice(&c);
-                if data {
+                // Once data has started, read on (still under the first-byte
+                // deadline) until its first line is complete, so a stream that
+                // opens with an error event can be failed over.
+                if data_started
+                    && (first_data_line_complete(&held) || held.len() >= FIRST_LINE_LIMIT)
+                {
+                    if opens_with_error(&held) {
+                        return Err(FirstByteError::StreamError);
+                    }
                     return Ok((response, Some(Bytes::from(held))));
                 }
             }
             Ok(None) => {
+                if opens_with_error(&held) {
+                    return Err(FirstByteError::StreamError);
+                }
                 let rest = (!held.is_empty()).then(|| Bytes::from(held));
                 return Ok((response, rest));
             }

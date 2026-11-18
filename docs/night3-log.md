@@ -233,3 +233,38 @@ All grep checks from card pass:
 - `grep -nE "provider\.prices\.get\(model\)" src/limiter.rs` → no matches (replaced with `provider.price_for(model)`)
 
 ---
+
+## SL-05: Reported cost from usage object (completed 2026-11-19)
+
+### Files changed
+- src/proxy.rs:
+  - Added `#[serde(flatten)] extra: serde_json::Map<String, Value>` to `UsageFields`
+  - Added `fn cost(&self, field: Option<&str>) -> Option<f64>` to extract reported cost from `extra` fields
+  - Changed `usage_from_body(body, cost_field: Option<&str>) -> Option<(Usage, Option<f64>)` to return both usage and reported cost
+  - Added `reported_cost: Option<f64>` and `cost_field: Option<String>` to `Settle`
+  - `Settle::new` sets `cost_field` from `entry.provider.usage_cost_field.clone()`
+  - `Tap::handle_line` extracts `reported_cost` after parsing `chunk.usage` before calling `into_usage`
+  - Non-streaming success branch in `forward` sets both `settle.usage` and `settle.reported_cost` from `usage_from_body`
+  - `Settle::drop` passes `self.reported_cost` to `record_usage`
+  - Updated unit test `usage_helpers` for new return type with cost assertions
+- tests/proxy.rs:
+  - Added `reported_cost_is_preferred_over_the_price_estimate` integration test
+  - Added helper `usage_reply_with_cost(cost: f64)` for mock responses with cost field
+
+### Tests added
+- Unit test in proxy.rs: `usage_helpers` updated with assertions for cost field extraction (valid cost, missing field, non-numeric value)
+- Integration test in tests/proxy.rs: `reported_cost_is_preferred_over_the_price_estimate` verifies:
+  - Upstream reports cost 0.5 → provider_spend_today = 0.5 (not the price estimate of 0.015)
+  - Upstream omits cost field → price estimate used (0.015 for 15 tokens at $1/1M)
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 116 unit tests + 5 main tests + 1 bench + 2 dashboard + 4 health + 47 proxy = 175 tests PASS
+
+### Verification
+All grep checks from card pass:
+- `grep -nE "reported_cost: Option<f64>" src/proxy.rs` → line 958
+- `grep -nE "fn cost\(&self, field: Option<&str>\)" src/proxy.rs` → line 1182
+
+---

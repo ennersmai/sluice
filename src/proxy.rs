@@ -480,7 +480,12 @@ async fn forward(
                         track.first_byte(first_elapsed);
                         let mut settle =
                             Settle::new(state, entry, prompt_estimate, hints, &track, status);
-                        settle.usage = usage_from_body(&bytes);
+                        if let Some((usage, cost)) =
+                            usage_from_body(&bytes, settle.cost_field.as_deref())
+                        {
+                            settle.usage = Some(usage);
+                            settle.reported_cost = cost;
+                        }
                         settle.out_bytes = bytes.len() as u64;
                         settle.completed = true;
                         // Records usage as it drops; the body is already
@@ -950,6 +955,8 @@ struct Settle {
     prompt_estimate: u64,
     hints: RemainingHints,
     usage: Option<Usage>,
+    reported_cost: Option<f64>,
+    cost_field: Option<String>,
     out_bytes: u64,
     track: Arc<ReqTrack>,
     /// Upstream status, which is also what the client got.
@@ -977,6 +984,8 @@ impl Settle {
             prompt_estimate,
             hints,
             usage: None,
+            reported_cost: None,
+            cost_field: entry.provider.usage_cost_field.clone(),
             out_bytes: 0,
             track: Arc::clone(track),
             status: status.as_u16(),
@@ -1000,7 +1009,7 @@ impl Drop for Settle {
                 usage,
                 self.hints,
                 Instant::now(),
-                None,
+                self.reported_cost,
             );
         }
         let error = if self.failed {
@@ -1130,7 +1139,11 @@ impl Tap {
         let Ok(chunk) = serde_json::from_slice::<StreamChunk>(payload) else {
             return true;
         };
-        let Some(usage) = chunk.usage.and_then(UsageFields::into_usage) else {
+        let Some(fields) = chunk.usage else {
+            return true;
+        };
+        self.settle.reported_cost = fields.cost(self.settle.cost_field.as_deref());
+        let Some(usage) = fields.into_usage() else {
             return true;
         };
         self.settle.usage = Some(usage);
@@ -1159,9 +1172,21 @@ struct UsageFields {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 impl UsageFields {
+    /// Extract the reported cost from the `extra` fields, if the field name is
+    /// configured and the value is a finite, non-negative number.
+    fn cost(&self, field: Option<&str>) -> Option<f64> {
+        let name = field?;
+        self.extra
+            .get(name)?
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    }
+
     fn into_usage(self) -> Option<Usage> {
         if self.prompt_tokens.is_none() && self.completion_tokens.is_none() {
             // Only a total: count it all as output so it is not lost.
@@ -1178,11 +1203,13 @@ impl UsageFields {
 }
 
 /// The `usage` object of a buffered (non-streaming) response body.
-fn usage_from_body(body: &[u8]) -> Option<Usage> {
-    serde_json::from_slice::<BodyUsage>(body)
-        .ok()?
-        .usage?
-        .into_usage()
+/// Returns both the parsed `Usage` and the reported cost (if any).
+fn usage_from_body(body: &[u8], cost_field: Option<&str>) -> Option<(Usage, Option<f64>)> {
+    let bu = serde_json::from_slice::<BodyUsage>(body).ok()?;
+    let fields = bu.usage?;
+    let cost = fields.cost(cost_field);
+    let usage = fields.into_usage()?;
+    Some((usage, cost))
 }
 
 /// Cheap pre-check before JSON parsing a chunk: does it contain
@@ -1752,14 +1779,54 @@ billing = \"free\"
         assert!(!mentions_usage_object(b"{\"x\":1}"));
         let body = br#"{"id":"x","usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
         assert_eq!(
-            usage_from_body(body),
-            Some(Usage {
-                input: 3,
-                output: 4
-            })
+            usage_from_body(body, None),
+            Some((
+                Usage {
+                    input: 3,
+                    output: 4
+                },
+                None
+            ))
         );
-        assert_eq!(usage_from_body(b"{}"), None);
-        assert_eq!(usage_from_body(b"nope"), None);
+        // With cost field
+        let body_with_cost =
+            br#"{"id":"x","usage":{"prompt_tokens":3,"completion_tokens":4,"cost":0.0123}}"#;
+        assert_eq!(
+            usage_from_body(body_with_cost, Some("cost")),
+            Some((
+                Usage {
+                    input: 3,
+                    output: 4
+                },
+                Some(0.0123)
+            ))
+        );
+        // cost field missing -> no cost
+        assert_eq!(
+            usage_from_body(body_with_cost, None),
+            Some((
+                Usage {
+                    input: 3,
+                    output: 4
+                },
+                None
+            ))
+        );
+        // cost field not a number -> no cost
+        let body_bad_cost =
+            br#"{"id":"x","usage":{"prompt_tokens":3,"completion_tokens":4,"cost":"x"}}"#;
+        assert_eq!(
+            usage_from_body(body_bad_cost, Some("cost")),
+            Some((
+                Usage {
+                    input: 3,
+                    output: 4
+                },
+                None
+            ))
+        );
+        assert_eq!(usage_from_body(b"{}", None), None);
+        assert_eq!(usage_from_body(b"nope", None), None);
     }
 
     #[test]

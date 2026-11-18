@@ -2064,3 +2064,78 @@ async fn five_xx_breaker_is_per_route_and_leaves_other_models_selectable() {
     assert_eq!(row["state"], "breaker_open");
     assert!(row["expires_in_ms"].as_u64().unwrap() > 0);
 }
+
+// ---------------------------------------------------------------------------
+// SL-05: reported cost from usage object
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reported_cost_is_preferred_over_the_price_estimate() {
+    // beta has usage_cost_field = "cost" and a price of $1/1M in and out
+    let alpha = Mock::start(Reply::json(500, "{}")).await; // never used
+    let beta = Mock::start(usage_reply_with_cost(0.5)).await;
+    let extra = r#"
+usage_cost_field = "cost"
+[provider.prices."fallback-model"]
+in_per_mtok = 1000.0
+out_per_mtok = 1000.0
+"#;
+    let (router, state) =
+        start_router_state(config(&alpha.base_url(), &beta.base_url(), extra), false).await;
+
+    // First request: upstream reports cost 0.5
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+
+    // Wait for settle to drop and record usage
+    let now = Instant::now();
+    let mut spend = state.limiter.provider_spend_today("beta", now);
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        spend = state.limiter.provider_spend_today("beta", now);
+        if (spend - 0.5).abs() < 1e-9 {
+            break;
+        }
+    }
+    assert!((spend - 0.5).abs() < 1e-9, "spend={spend}, expected 0.5");
+
+    // Second request: upstream does NOT report cost, so estimate is used
+    // usage is 10/5 tokens, price is 1000/1M -> (15 * 1000) / 1e6 = 0.015
+    let beta2 = Mock::start(usage_reply()).await;
+    let extra2 = r#"
+usage_cost_field = "cost"
+[provider.prices."fallback-model"]
+in_per_mtok = 1000.0
+out_per_mtok = 1000.0
+"#;
+    let cfg2 = config_full("", &alpha.base_url(), &beta2.base_url(), extra2, ALPHA_KEY);
+    let (router2, state2) = start_router_state(cfg2, false).await;
+    let r = post_json(router2, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+
+    let now2 = Instant::now();
+    let mut spend2 = state2.limiter.provider_spend_today("beta", now2);
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        spend2 = state2.limiter.provider_spend_today("beta", now2);
+        if (spend2 - 0.015).abs() < 1e-9 {
+            break;
+        }
+    }
+    assert!(
+        (spend2 - 0.015).abs() < 1e-9,
+        "spend2={spend2}, expected 0.015"
+    );
+}
+
+/// Returns a usage reply with a custom cost field.
+fn usage_reply_with_cost(cost: f64) -> Reply {
+    Reply::json(
+        200,
+        &format!(
+            r#"{{"id":"x","choices":[],"usage":{{"prompt_tokens":10,"completion_tokens":5,"cost":{}}}}}"#,
+            cost
+        ),
+    )
+}

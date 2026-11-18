@@ -42,6 +42,42 @@ All grep checks from card pass:
 
 ---
 
+## SL-02: Pure calendar helpers for monthly credit and tpmo periods (completed 2026-11-19)
+
+### Files changed
+- src/billing.rs: New module with pure calendar functions (no I/O, no clock)
+- src/lib.rs: Added `pub mod billing;`
+
+### Functions implemented
+- `days_from_civil(y: i64, m: u32, d: u32) -> i64`: days since 1970-01-01 using Hinnant's algorithm (copied from limiter::parse_http_date)
+- `civil_from_days(days: i64) -> (i64, u32, u32)`: inverse, using Hinnant's civil-from-days algorithm (same as events::format_utc)
+- `days_in_month(y: i64, m: u32) -> u32`: handles leap years
+- `parse_date(s: &str) -> Option<i64>`: strict YYYY-MM-DD to days since epoch, rejects invalid dates
+- `boundary(y: i64, m: u32, reset_day: u8, reset_hour: u8) -> u64`: private helper for end-of-month rule
+- `month_start(unix: u64, reset_day: u8, reset_hour: u8) -> u64`: start of monthly period containing unix
+- `next_month_start(unix: u64, reset_day: u8, reset_hour: u8) -> u64`: boundary of month after month_start
+
+### Module docs
+States the end-of-month rule in one sentence: "a reset day past the end of a short month means that month's last day"
+
+### Tests added (4 tests in billing.rs)
+- `civil_round_trip_and_known_days`: verifies known day counts and round-trip
+- `parse_date_accepts_only_real_dates`: accepts "2026-11-18", rejects "2026-02-30", "2026-13-01", "26-11-18", "2026-11-18x", ""
+- `month_period_end_of_month_rule`: reset_day 31 in February falls back to last day; at boundary instant belongs to new period; leap year reset_day 30 at 2028-02-29 works
+- `month_period_reset_hour_and_year_boundary`: reset_hour=8 works; year boundary with reset_day=1 works
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 109 unit tests + 5 main tests + 1 bench + 2 dashboard + 4 health + 46 proxy = 167 tests PASS
+
+### Verification
+All grep checks from card pass:
+- `grep -nE "pub fn (month_start|next_month_start|parse_date|days_in_month)" src/billing.rs` → 4 lines (days_in_month, parse_date, month_start, next_month_start)
+- `grep -nE "^pub mod billing;" src/lib.rs` → line 6
+
+---
+
 ## Provider billing audit (step 7), checked 2026-11-19
 
 Rule applied: where the provider's current documentation does not clearly confirm a standing free tier with no possibility of charges, billing = "paid" (removed from pools) and listed for Mai.

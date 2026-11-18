@@ -3,6 +3,7 @@
 //! The binary in `main.rs` is a thin wrapper; everything lives here so
 //! integration tests can run the server in-process.
 
+pub mod billing;
 pub mod catalog;
 pub mod config;
 pub mod discover;

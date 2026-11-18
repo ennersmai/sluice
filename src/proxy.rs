@@ -1456,9 +1456,15 @@ fn too_large_kind(body: &[u8]) -> Option<TooLargeKind> {
         "reduce the length",
         "request too large",
     ];
-    // Gemini rejects history whose tool calls came from another model
-    // (no thought_signature). Another route can serve the request.
-    const OTHER: &[&str] = &["thought_signature"];
+    // Request shapes a particular provider cannot accept, while another route can:
+    // - Gemini rejects history whose tool calls came from another model (no thought_signature).
+    // - Cloudflare Workers AI rejects array-form message content
+    //   ("Bad input: ... Type mismatch of '/messages/0/content', 'array' not in 'string'").
+    const OTHER: &[&str] = &[
+        "thought_signature",
+        "type mismatch of '/messages",
+        "bad input: error: oneof",
+    ];
     let head = body.get(..body.len().min(16 * 1024)).unwrap_or_default();
     let text = String::from_utf8_lossy(head).to_ascii_lowercase();
     let any = |list: &[&str]| list.iter().any(|p| text.contains(p));

@@ -1232,6 +1232,26 @@ async fn thought_signature_400_fails_over_but_learns_no_ceiling() {
     assert!(status["providers"][0]["models"][0]["ceiling_tokens"].is_null());
 }
 
+/// Cloudflare Workers AI rejects array-form message content with a 400
+/// (seen in real traffic on 2026-11-18). On a pool route that must fail over,
+/// not end the agent's turn, and it says nothing about size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn content_shape_400_fails_over_and_learns_no_ceiling() {
+    let alpha = Mock::start(Reply::json(
+        400,
+        "{\"errors\":[{\"message\":\"AiError: Bad input: Error: oneOf at '/' not met, 0 matches: required properties at '/' are 'prompt', Type mismatch of '/messages/0/content', 'array' not in 'string'\"}]}",
+    ))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    let status = get_json(router, "/status").await;
+    assert!(status["providers"][0]["models"][0]["ceiling_tokens"].is_null());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_max_input_tokens_skips_from_the_first_request() {
     let beta = Mock::start(Reply::json(200, "{}")).await;

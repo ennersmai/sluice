@@ -79,10 +79,13 @@ reset_utc_hour = 8  # Google resets at midnight Pacific; 8 is safe in both PST a
 # billing = "credit"
 # credit_usd = 10.0
 # credit_reset_day = 1
-# credit_spent_usd = 0.0  # seed: applies only to the credit period containing credit_spent_date
-# credit_spent_date = "2026-01-01"
-# tpmo = 0  # tokens per month, 0 = unknown
-# [provider.prices."example-model"]
+# # credit already spent outside sluice this period (a floor; applies only to
+# # the credit period containing the date):
+# # credit_spent_usd = 10.0
+# # credit_spent_date = "2026-01-01"
+# [provider.limits]
+# tpmo = 0                  # tokens per month from credit_reset_day, 0 = unknown
+# [provider.prices."example-model"]   # required for credit; unpriced models use the highest price
 # in_per_mtok = 0.0
 # out_per_mtok = 0.0
 

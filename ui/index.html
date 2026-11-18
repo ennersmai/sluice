@@ -30,6 +30,7 @@ html{color-scheme:dark}
 body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
 .st-ok{--c:var(--ok)}.st-cooling{--c:var(--cooling)}.st-breaker_open,.st-key_disabled{--c:var(--bad)}
 .st-paused{--c:var(--paused)}.st-missing,.st-unavailable{--c:var(--missing)}
+.st-payment_required{--c:var(--bad)}.st-credit_exhausted{--c:var(--cooling)}
 header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:var(--s4);padding:var(--s3) var(--s5);background:rgba(19,24,31,.96);border-bottom:1px solid var(--line)}
 header h1{font-size:17px;margin:0;letter-spacing:.3px;font-weight:650}
 .ver{color:var(--faint);font-family:var(--mono);font-size:11px}
@@ -103,7 +104,7 @@ input:focus{outline:1px solid var(--info);border-color:var(--info)}
 .spark{margin-left:auto;width:120px;height:30px}
 .notes{margin-top:var(--s2)}
 .note{font-size:12px;color:var(--cooling);word-break:break-word}
-.note.p{color:var(--missing)}
+.note.p{color:var(--missing)}.note.bad{color:var(--bad)}.note.i{color:var(--dim)}
 .err{margin-top:var(--s2);font-size:12px;color:var(--bad);word-break:break-word}
 .btns{display:flex;align-items:center;gap:var(--s2);margin-top:var(--s3);flex-wrap:wrap}
 .fb{font-size:12px;color:var(--dim)}.fb.ok{color:var(--ok)}.fb.bad{color:var(--bad)}
@@ -222,6 +223,7 @@ function fmtAgo(ms) {
   return Math.floor(s / 86400) + 'd ago';
 }
 function fmtUsd(v) { return '$' + (Number(v) || 0).toFixed(2); }
+function fmtUsd4(v) { var n = Number(v) || 0; return '$' + n.toFixed(Math.abs(n) < 1 ? 4 : 2); }
 function stateLabel(s) { return String(s).replace('_', ' '); }
 
 var S = null;            // last /status snapshot, merged with counters events
@@ -282,7 +284,7 @@ function mkPill() {
 function setPill(p, state, until) {
   p.className = 'pill st-' + state;
   p.lab.nodeValue = stateLabel(state);
-  setCd(p.cd, state === 'cooling' || state === 'breaker_open' ? until : null);
+  setCd(p.cd, state === 'cooling' || state === 'breaker_open' || state === 'credit_exhausted' ? until : null);
 }
 function lastErrText(e) { return e.reason + (e.model ? ' (' + e.model + ')' : ''); }
 
@@ -322,7 +324,7 @@ function renderSummary() {
   var cap = Number(pd.cap_usd) || 0, sp = Number(pd.spend_usd) || 0;
   setTile('paid', fmtUsd(sp) + ' / ' + fmtUsd(cap), cap ? Math.round(sp / cap * 100) + '% of cap' : 'paid routes off',
     cap && sp >= cap ? 'bad' : cap && sp >= cap * 0.8 ? 'warn' : '');
-  setTile('spend', fmtUsd(S.spend_today_usd || 0), 'all providers, estimate');
+  setTile('spend', fmtUsd4(S.spend_today_usd), 'all providers, estimate');
   setTile('sticky', String(S.sticky_sessions || 0), 'idle 2 h expiry');
   $('h-act').textContent = String(S.active_requests);
   $('h-up').textContent = fmtDur(S.uptime_secs + (performance.now() - statusAt) / 1000);
@@ -340,6 +342,8 @@ function routeState(spec) {
   var i = spec.indexOf('/'), pid = spec.slice(0, i), model = spec.slice(i + 1), p = findProv(pid);
   if (!p) return { s: 'missing', note: 'unknown provider' };
   if (p.state === 'paused') return { s: 'paused', note: 'provider paused' };
+  if (p.state === 'payment_required') return { s: 'payment_required', note: '402: cleared on dashboard' };
+  if (p.state === 'credit_exhausted') return { s: 'credit_exhausted', until: p._until, note: 'credit guard reached' };
   if (p.state === 'key_disabled') return { s: 'key_disabled', note: 'all keys disabled' };
   if (p.state === 'breaker_open') return { s: 'breaker_open', until: p._until, note: 'breaker open' };
   var m = (p.models || []).filter(function (x) { return x.model === model; })[0];
@@ -519,13 +523,14 @@ function updateCard(c, p) {
   setPill(c.pill, p.state, p._until);
   var kd = (p.disabled_keys || []).length;
   c.tags.textContent = '';
-  if (p.billing === 'credit') c.tags.appendChild(el('span', 'tag credit', 'credit'));
-  else if (p.billing === 'free') c.tags.appendChild(el('span', 'tag free', 'free'));
-  else if (p.paid) c.tags.appendChild(el('span', 'tag paid', 'paid'));
+  if (p.billing) c.tags.appendChild(el('span', 'tag ' + p.billing, p.billing));
   if (p.trains_on_input) c.tags.appendChild(el('span', 'tag', 'trains on input'));
   c.tags.appendChild(el('span', 'tag', p.keys + (p.keys === 1 ? ' key' : ' keys') + (kd ? ', ' + kd + ' off' : '')));
   var lim = p.limits || {};
-  BARS.forEach(function (b, i) { setBar(c.bars[i], p[b[1]], lim[b[0]]); });
+  BARS.forEach(function (b, i) {
+    setBar(c.bars[i], p[b[1]], lim[b[0]]);
+    if (b[0] === 'tpmo') c.bars[i].hidden = lim.tpmo == null;   // only when configured
+  });
   var t = p.ttft_ms || {};
   c.sIn.v.textContent = fmtN(p.tokens_in_today);
   c.sOut.v.textContent = fmtN(p.tokens_out_today);
@@ -538,15 +543,13 @@ function updateCard(c, p) {
   (p.cooldowns || []).forEach(function (k) {
     note(c.notes, k.scope + ' cooldown' + (k.model ? ' ' + k.model : '') + (k.key ? ' ' + k.key : ''), '', k._until);
   });
-  if (p.payment_required) {
-    note(c.notes, '402 payment required: provider disabled until cleared', '', null);
+  if (p.payment_required) note(c.notes, '402 payment required: provider disabled until cleared', 'bad');
+  if (p.credit) {
+    var cr = p.credit;
+    note(c.notes, 'credit: ' + fmtUsd4(cr.spent_usd) + ' of ' + fmtUsd(cr.usd) + ' (stops at ' + fmtUsd(cr.guard_usd) + '), resets ' +
+      new Date(cr.resets_at_ms).toLocaleDateString(), cr.exhausted ? 'p' : 'i');
   }
-  if (p.credit && p.credit.exhausted) {
-    note(c.notes, 'credit: ' + fmtUsd(p.credit.spent_usd) + ' of ' + fmtUsd(p.credit.usd) + ' (stops at ' + fmtUsd(p.credit.guard_usd) + '), resets ' + new Date(p.credit.resets_at_ms).toLocaleDateString(), 'p', p.credit.resets_at_ms);
-  } else if (p.credit) {
-    note(c.notes, 'credit: ' + fmtUsd(p.credit.spent_usd) + ' of ' + fmtUsd(p.credit.usd) + ' (stops at ' + fmtUsd(p.credit.guard_usd) + '), resets ' + new Date(p.credit.resets_at_ms).toLocaleDateString(), '');
-  }
-  note(c.notes, 'spend today ' + fmtUsd(p.spend_today_usd || 0), '');
+  note(c.notes, 'spend today ' + fmtUsd4(p.spend_today_usd), 'i');
   if (p.last_error) {
     c.err.hidden = false;
     c.errText.nodeValue = 'last error: ' + lastErrText(p.last_error) + ' - ';

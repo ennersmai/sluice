@@ -322,3 +322,10 @@ All grep checks from card pass:
 - **Tests:** `status_reports_billing_spend_credit_and_sticky_sessions`; `t26_status_and_events_carry_no_key_material_or_message_text` still green.
 - **Suite:** fmt, clippy -D warnings clean; 195 passed (127 unit + 5 + 1 + 2 + 4 + 56 proxy).
 - **Adapted:** the credit `until` Instant uses the `unix` already passed into `provider_json` (`now + (resets_at - unix)`), as the card describes, without a new limiter method.
+
+## SL-14: Dashboard shows billing, credit, 402 block, spend, sticky sessions and tpmo
+- **Files:** ui/index.html
+- **What:** CSS `.st-payment_required` (bad) and `.st-credit_exhausted` (cooling), plus `.note.bad` / `.note.i` (neutral) note styles. `fmtUsd4` (4 decimals below $1). The spend tile uses `fmtUsd4(S.spend_today_usd)`; sticky tile unchanged. `setPill` shows the countdown for `credit_exhausted`. `routeState` handles `payment_required` ("402: cleared on dashboard") and `credit_exhausted` (until `p._until`, "credit guard reached"). Card tag is now `el('span', 'tag ' + p.billing, p.billing)`. Credit note `credit: $spent of $usd (stops at $guard), resets <date>` with class `p` when exhausted (neutral otherwise); bad-styled 402 note; `spend today` note via `fmtUsd4`. The tpmo bar is hidden when `limits.tpmo` is null. All DOM via textContent/createTextNode; no external URLs. SL-16/16a behaviour untouched (10-row rolling window, non-status provider palette).
+- **Tests:** none new; `t25_dashboard_file_has_no_external_urls_and_is_small` and `t25_root_serves_the_dashboard_as_html` green. `node --check` on the extracted script passes. 45,725 bytes.
+- **Suite:** 195 passed.
+- **Adapted:** the SL-16 commit (OpenCode) had already added part of this card (spend/sticky tiles, Clear 402 button and handler, tpmo in BARS, credit/402/spend notes, `.tag.credit`/`.tag.free`). This card completed and corrected it: the exhausted-credit note passed `resets_at_ms` (epoch ms) as a `performance.now()`-based countdown deadline, which would have shown a wrong countdown; it now relies on the pill's countdown from `expires_in_ms` instead. Spend and credit notes no longer use the amber (warning) note colour.

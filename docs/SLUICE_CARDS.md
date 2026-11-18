@@ -592,3 +592,14 @@ Done when:
 - `grep -nE "/admin/provider/\{id\}/payment/clear" README.md` matches.
 
 Do not: put real keys, real limits or real prices in the example. Do not edit router.toml or ROUTER_PRD.md. Do not write new .md files.
+---
+
+ID: SL-16
+Goal: Two dashboard fixes requested by Mai. (1) The live routing panel shows only the 10 most recent requests, with the rest behind a toggle. (2) Provider colours in the usage chart and on the provider cards never use colours that read as status (red, amber, green), so a provider such as or-free or llm7 no longer looks like it is failing.
+Files: `ui/index.html` only. Read `tests/dashboard.rs` (T25: no external URLs, under 60 KB).
+Change:
+1. Live routing: render in-flight rows plus the 10 most recent finished rows that pass the current filters. Below them, when more finished rows exist, show a button "Show N more" (N = how many are hidden). Clicking it expands to the full list (up to the 200 kept in memory) and the button becomes "Show fewer". New rows still appear at the top; in collapsed mode the oldest visible row drops off as new ones arrive (rolling window). The expanded/collapsed choice survives re-renders and is stored in localStorage (wrap every localStorage access in try/catch).
+2. Provider colours: find where per-provider series colours are assigned (chart bars, legend swatches, card swatches, sparklines). Replace that palette with 12 distinct hues that avoid the status colours: no reds, oranges, ambers, yellows or greens. Use blues, indigos, violets, purples, magentas, pinks, teals, cyans, slates and browns, all readable on the dark background. Define them as CSS custom properties or one constant array. Assign colours by the provider's index in config order so they are stable across reloads. Status colours (ok, cooling, breaker or error, paused, missing) stay exactly as they are, and are used only for status.
+Tests: none new. Run `cargo test --locked`; T25 must still pass (file under 60 KB, no http(s) URLs).
+Done when: `cargo test --locked` passes; `node --check` passes on the script extracted from ui/index.html; `grep -c "Show fewer" ui/index.html` is at least 1.
+Do not: change any Rust file, the /status or /events payloads, or the status colours. Do not add external fonts or scripts.

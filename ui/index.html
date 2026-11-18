@@ -442,6 +442,7 @@ function mkCard(p) {
   var btns = el('div', 'btns');
   c.pause = el('button', null, 'Pause');
   c.clear = el('button', null, 'Clear cooldown');
+  c.ceil = el('button', null, 'Clear ceilings');
   c.tog = el('button', null, 'Models');
   c.fb = el('span', 'fb');
   c.pause.onclick = function () {
@@ -454,8 +455,12 @@ function mkCard(p) {
     admin(c, c.clear, '/admin/cooldowns/clear?provider=' + encodeURIComponent(p.id), function () { return 'Clear cooldown'; },
       function (j) { return j.cleared ? 'cleared ' + j.cleared + (j.cleared === 1 ? ' cooldown' : ' cooldowns') : 'nothing to clear'; });
   };
+  c.ceil.onclick = function () {
+    admin(c, c.ceil, '/admin/ceilings/clear?provider=' + encodeURIComponent(p.id), function () { return 'Clear ceilings'; },
+      function (j) { return j.cleared ? 'cleared ' + j.cleared + (j.cleared === 1 ? ' ceiling' : ' ceilings') : 'no ceilings'; });
+  };
   c.tog.onclick = function () { c.open = !c.open; updateCard(c, findProv(p.id)); };
-  add(btns, c.pause, c.clear, c.tog, c.fb);
+  add(btns, c.pause, c.clear, c.ceil, c.tog, c.fb);
   c.models = el('table', 'models');
   c.models.hidden = true;
   var th = el('thead'), hr = el('tr');
@@ -514,7 +519,9 @@ function updateCard(c, p) {
       st.appendChild(pl);
       var le = el('td', 'dim');
       if (m.last_error) { le.appendChild(document.createTextNode(lastErrText(m.last_error) + ' ')); le.appendChild(agoSpan(m.last_error.time_ms)); }
-      add(r, el('td', 'mono', m.model), st, el('td', 'num', fmtN(m.requests_today)),
+      var mt = el('td', 'mono', m.model);
+      if (m.ceiling_tokens) mt.appendChild(el('span', 'dim', ' max ~' + (m.ceiling_tokens >= 1000 ? Math.round(m.ceiling_tokens / 1000) + 'k' : m.ceiling_tokens) + ' in' + (m.ceiling_source === 'config' ? ' (cfg)' : '')));
+      add(r, mt, st, el('td', 'num', fmtN(m.requests_today)),
         el('td', 'num', fmtN(m.tokens_in_today)), el('td', 'num', fmtN(m.tokens_out_today)), le);
       c.mbody.appendChild(r);
     });

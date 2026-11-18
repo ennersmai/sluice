@@ -26,8 +26,10 @@ Each `[[provider]]`:
 | `drop_params` | Request fields this provider rejects, removed before sending |
 | `models` | Allowlist of upstream model ids; omit to allow any |
 | `[provider.limits]` | `scope` (`provider`, `key`, `key_model`), `rpm`, `rpd`, `tpm`, `tpd` |
-| `[provider.model_limits."id"]` | Optional per-model override |
+| `[provider.model_limits."id"]` | Optional per-model override: `rpm`, `rpd`, `tpm`, `tpd` and `max_input_tokens` (largest request, in sluice's pre-flight token estimate, the model accepts; 0 = unknown) |
 | `[provider.prices."id"]` | `in_per_mtok`, `out_per_mtok` in USD (paid providers) |
+
+**Learned size ceilings.** When a pool route refuses a request as too large (HTTP 413, or a 400/422 naming a context-length limit), sluice records that request's pre-flight token estimate as the route's ceiling and skips the route (reason `too_large`, no upstream call) for any request at least that big. The lower of a configured `max_input_tokens` and the learned value applies; a learned ceiling is never raised automatically, is saved in the state file, and is cleared by the admin endpoints above or when the provider/model leaves the config. `/status` shows `ceiling_tokens` and `ceiling_source` per model.
 
 **Copy real limits from each provider's dashboard.** Free-tier numbers published in blog posts and docs go stale, and sluice never hardcodes any. `0` (or leaving a limit out) means unknown: sluice then relies on the provider's 429 responses and `Retry-After` to cool a route down. Known limits let it skip a route without wasting a request.
 
@@ -79,7 +81,8 @@ Calls the provider's `GET /models` with its first key and prints matching ids, s
 | `GET /` | Dashboard |
 | `GET /status`, `GET /events` | JSON snapshot, server-sent events |
 | `POST /admin/provider/{id}/pause`, `/resume` | Take a provider out of rotation and back |
-| `POST /admin/cooldowns/clear[?provider=id]` | Clear cooldowns and open breakers |
+| `POST /admin/cooldowns/clear[?provider=id]` | Clear cooldowns, open breakers and learned size ceilings |
+| `POST /admin/ceilings/clear[?provider=id]` | Clear learned size ceilings only |
 
 Response headers: `x-router-provider`, `x-router-upstream-model`, `x-router-attempts`, `x-router-overhead-ms`. Request header: `x-router-private: 1`.
 

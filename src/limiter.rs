@@ -248,6 +248,8 @@ pub struct State {
     unavailable: HashSet<(String, String)>,
     /// Per-(provider, model) breakers for HTTP 5xx.
     route_breakers: HashMap<(String, String), Breaker>,
+    /// Learned size ceilings (pre-flight estimate) per (provider, model).
+    ceilings: HashMap<(String, String), u64>,
     paused: HashSet<String>,
     requests: HashMap<RouteId, u64>,
     pool_counters: HashMap<String, usize>,
@@ -268,6 +270,7 @@ impl Default for State {
             missing: HashSet::new(),
             unavailable: HashSet::new(),
             route_breakers: HashMap::new(),
+            ceilings: HashMap::new(),
             paused: HashSet::new(),
             requests: HashMap::new(),
             pool_counters: HashMap::new(),
@@ -360,6 +363,18 @@ impl RouteView for State {
         {
             return Some(Skip::Unavailable);
         }
+        if estimate > 0
+            && effective_ceiling(
+                provider,
+                model,
+                self.ceilings
+                    .get(&(id.to_string(), model.to_string()))
+                    .copied(),
+            )
+            .is_some_and(|(c, _)| c <= estimate)
+        {
+            return Some(Skip::TooLarge);
+        }
         if let Some(until) = self
             .route_breakers
             .get(&(id.to_string(), model.to_string()))
@@ -404,6 +419,41 @@ impl RouteView for State {
     }
 }
 
+/// Where an effective size ceiling comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingSource {
+    Learned,
+    Config,
+}
+
+impl CeilingSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Learned => "learned",
+            Self::Config => "config",
+        }
+    }
+}
+
+/// The lower of the configured `max_input_tokens` and the learned ceiling.
+/// On a tie the configured value wins.
+pub fn effective_ceiling(
+    provider: &Provider,
+    model: &str,
+    learned: Option<u64>,
+) -> Option<(u64, CeilingSource)> {
+    let config = provider
+        .model_limits
+        .get(model)
+        .and_then(|l| l.max_input_tokens);
+    match (config, learned) {
+        (Some(c), Some(l)) if l < c => Some((l, CeilingSource::Learned)),
+        (Some(c), _) => Some((c, CeilingSource::Config)),
+        (None, Some(l)) => Some((l, CeilingSource::Learned)),
+        (None, None) => None,
+    }
+}
+
 /// A cooldown, with its deadline as wall-clock Unix seconds, for persistence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CooldownSnap {
@@ -428,6 +478,8 @@ pub struct Snapshot {
     /// (provider, hour number, tokens in, tokens out)
     pub hourly: Vec<(String, u64, u64, u64)>,
     pub cooldowns: Vec<CooldownSnap>,
+    /// (provider, model, ceiling in estimated tokens)
+    pub ceilings: Vec<(String, String, u64)>,
     pub spend: Spend,
 }
 
@@ -446,6 +498,8 @@ pub struct ProviderView {
     pub unavailable: Vec<String>,
     /// Open per-model breakers with their expiry.
     pub route_breakers: Vec<(String, Instant)>,
+    /// Learned size ceilings by model.
+    pub ceilings: Vec<(String, u64)>,
     /// Counters of the provider's limit scope, summed over its buckets.
     pub requests_minute: u64,
     pub requests_day: u64,
@@ -753,6 +807,35 @@ impl Limiter {
         n
     }
 
+    /// Learn that `model` refused a request estimated at `estimate` tokens.
+    /// Keeps the lower of the old and new value. Returns the new ceiling
+    /// when it was learned or lowered.
+    pub fn record_ceiling(&self, provider: &str, model: &str, estimate: u64) -> Option<u64> {
+        if estimate == 0 {
+            return None;
+        }
+        let mut st = self.lock();
+        let slot = st
+            .ceilings
+            .entry((provider.to_string(), model.to_string()))
+            .or_insert(u64::MAX);
+        if estimate < *slot {
+            *slot = estimate;
+            Some(estimate)
+        } else {
+            None
+        }
+    }
+
+    /// Forget learned ceilings, for one provider or all. Returns how many.
+    pub fn clear_ceilings(&self, provider: Option<&str>) -> usize {
+        let mut st = self.lock();
+        let before = st.ceilings.len();
+        st.ceilings
+            .retain(|(p, _), _| provider.is_some_and(|id| id != p));
+        before - st.ceilings.len()
+    }
+
     /// Read-only state of one provider for `/status` and `/events`.
     pub fn provider_view(&self, provider: &Provider, now: Instant) -> ProviderView {
         let st = self.lock();
@@ -801,6 +884,13 @@ impl Limiter {
             .filter_map(|((_, m), b)| b.open_until.filter(|u| *u > now).map(|u| (m.clone(), u)))
             .collect();
         view.route_breakers.sort();
+        view.ceilings = st
+            .ceilings
+            .iter()
+            .filter(|((p, _), _)| p == id)
+            .map(|((_, m), c)| (m.clone(), *c))
+            .collect();
+        view.ceilings.sort();
         let day = day_index(st.unix(now), provider.reset_utc_hour);
         // Only the buckets of the provider's own scope, so route buckets
         // that exist for per-model limits are not counted twice.
@@ -856,6 +946,11 @@ impl Limiter {
                     step: c.step,
                 })
                 .collect(),
+            ceilings: st
+                .ceilings
+                .iter()
+                .map(|((p, m), c)| (p.clone(), m.clone(), *c))
+                .collect(),
             spend: st.spend,
         }
     }
@@ -863,7 +958,13 @@ impl Limiter {
     /// Load a snapshot, discarding anything past its reset or expiry.
     /// `reset_hour` gives each provider's day boundary; scopes of unknown
     /// providers are dropped.
-    pub fn restore(&self, snap: Snapshot, reset_hour: &dyn Fn(&str) -> Option<u8>, now: Instant) {
+    pub fn restore(
+        &self,
+        snap: Snapshot,
+        reset_hour: &dyn Fn(&str) -> Option<u8>,
+        model_known: &dyn Fn(&str, &str) -> bool,
+        now: Instant,
+    ) {
         let mut st = self.lock();
         let unix = st.unix(now);
         for d in snap.days {
@@ -897,6 +998,11 @@ impl Limiter {
                     step: c.step,
                 },
             );
+        }
+        for (p, m, c) in snap.ceilings {
+            if c > 0 && model_known(&p, &m) {
+                st.ceilings.insert((p, m), c);
+            }
         }
         if snap.spend.day == unix / 86_400 {
             st.spend = snap.spend;
@@ -1276,7 +1382,7 @@ mod tests {
 
         let l2 = Limiter::new();
         let reset = |id: &str| (id == "p").then_some(0u8);
-        l2.restore(snap, &reset, now);
+        l2.restore(snap, &reset, &|_, _| true, now);
         assert_eq!(hourly_io(&l2, now), [(7, 3)]);
         assert_eq!(skip(&l2, &c, 0, "m", 0, now).unwrap().name(), "cooldown");
         assert!(skip(&l2, &c, 1, "m", 0, now).is_none());
@@ -1309,12 +1415,18 @@ mod tests {
                 until_unix: unix - 1,
                 step: 3,
             }],
+            ceilings: vec![("p".into(), "gone".into(), 100)],
             spend: Spend {
                 day: unix / 86_400 - 1,
                 usd: 5.0,
             },
         };
-        l.restore(snap, &|id| (id == "p").then_some(0u8), now);
+        l.restore(
+            snap,
+            &|id| (id == "p").then_some(0u8),
+            &|_, m| m != "gone",
+            now,
+        );
         assert_eq!(l.snapshot(now), Snapshot::default());
         assert_eq!(l.spend_today(now), 0.0);
     }

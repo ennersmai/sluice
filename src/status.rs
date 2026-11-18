@@ -40,6 +40,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/admin/provider/{id}/pause", post(pause))
         .route("/admin/provider/{id}/resume", post(resume))
         .route("/admin/cooldowns/clear", post(clear_cooldowns))
+        .route("/admin/ceilings/clear", post(clear_ceilings))
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -117,21 +118,20 @@ fn set_paused(state: &AppState, id: &str, paused: bool) -> Result<Json<Value>, A
     Ok(Json(json!({"provider": provider.id, "paused": paused})))
 }
 
-/// `POST /admin/cooldowns/clear`, optionally `?provider=id`.
-async fn clear_cooldowns(
-    State(state): State<Arc<AppState>>,
-    uri: Uri,
-) -> Result<Json<Value>, ApiError> {
+/// The validated `?provider=id` of an admin request.
+fn provider_param<'a>(state: &'a AppState, uri: &Uri) -> Result<Option<&'a str>, ApiError> {
     let wanted = uri.query().and_then(|q| {
         q.split('&')
             .find_map(|pair| pair.strip_prefix("provider="))
             .filter(|v| !v.is_empty())
     });
-    let provider = match wanted {
-        Some(id) => Some(known_provider(&state, id)?.id.as_str()),
-        None => None,
-    };
-    let cleared = state.limiter.clear_cooldowns(provider);
+    match wanted {
+        Some(id) => Ok(Some(known_provider(state, id)?.id.as_str())),
+        None => Ok(None),
+    }
+}
+
+fn announce_cleared(state: &AppState, provider: Option<&str>) {
     match provider {
         Some(id) => state.events.route_state(id, None, None, "cleared", None),
         None => {
@@ -140,6 +140,31 @@ async fn clear_cooldowns(
             }
         }
     }
+}
+
+/// `POST /admin/cooldowns/clear`, optionally `?provider=id`. Also forgets
+/// learned size ceilings.
+async fn clear_cooldowns(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+) -> Result<Json<Value>, ApiError> {
+    let provider = provider_param(&state, &uri)?;
+    let cleared = state.limiter.clear_cooldowns(provider);
+    let ceilings = state.limiter.clear_ceilings(provider);
+    announce_cleared(&state, provider);
+    Ok(Json(
+        json!({"cleared": cleared, "ceilings_cleared": ceilings, "provider": provider}),
+    ))
+}
+
+/// `POST /admin/ceilings/clear`, optionally `?provider=id`.
+async fn clear_ceilings(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+) -> Result<Json<Value>, ApiError> {
+    let provider = provider_param(&state, &uri)?;
+    let cleared = state.limiter.clear_ceilings(provider);
+    announce_cleared(&state, provider);
     Ok(Json(json!({"cleared": cleared, "provider": provider})))
 }
 
@@ -343,9 +368,13 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
             } else {
                 ("ok", None)
             };
+            let learned = view.ceilings.iter().find(|(n, _)| n == m).map(|(_, c)| *c);
+            let ceiling = crate::limiter::effective_ceiling(p, m, learned);
             json!({
                 "model": m,
                 "state": state_name,
+                "ceiling_tokens": ceiling.map(|(c, _)| c),
+                "ceiling_source": ceiling.map(|(_, s)| s.name()),
                 "expires_in_ms": until.map(|u| expires_ms(u, now)),
                 "requests_today": stat.map_or(0, |s| s.requests),
                 "tokens_in_today": stat.map_or(0, |s| s.tokens_in),

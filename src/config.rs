@@ -170,6 +170,9 @@ pub struct Limits {
     pub rpd: Option<u64>,
     pub tpm: Option<u64>,
     pub tpd: Option<u64>,
+    /// Largest request (pre-flight token estimate) the model accepts.
+    /// Only meaningful in `model_limits`.
+    pub max_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +373,8 @@ struct RawLimits {
     tpm: u64,
     #[serde(default)]
     tpd: u64,
+    #[serde(default)]
+    max_input_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -398,6 +403,7 @@ fn limits_from(rpm: u64, rpd: u64, tpm: u64, tpd: u64) -> Limits {
         rpd: known(rpd),
         tpm: known(tpm),
         tpd: known(tpd),
+        max_input_tokens: None,
     }
 }
 
@@ -604,7 +610,13 @@ fn validate(raw: RawConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf
                     "{label}: model_limits entry \"{model}\" is not in the provider's models allowlist"
                 ));
             }
-            model_limits.insert(model.clone(), limits_from(l.rpm, l.rpd, l.tpm, l.tpd));
+            model_limits.insert(
+                model.clone(),
+                Limits {
+                    max_input_tokens: known(l.max_input_tokens),
+                    ..limits_from(l.rpm, l.rpd, l.tpm, l.tpd)
+                },
+            );
         }
 
         let mut prices = BTreeMap::new();
@@ -934,7 +946,8 @@ keys_env = "GROQ_KEYS"
                 rpm: None,
                 rpd: Some(100),
                 tpm: None,
-                tpd: None
+                tpd: None,
+                max_input_tokens: None
             }
         );
         assert_eq!(
@@ -943,7 +956,8 @@ keys_env = "GROQ_KEYS"
                 rpm: Some(3),
                 rpd: None,
                 tpm: None,
-                tpd: None
+                tpd: None,
+                max_input_tokens: None
             }
         );
     }

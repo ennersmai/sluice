@@ -23,6 +23,9 @@ pub enum Skip {
     Missing,
     /// The upstream refused this model with a 403 (region or plan).
     Unavailable,
+    /// A learned or configured size ceiling is at or below the request's
+    /// estimate. No expiry.
+    TooLarge,
     BreakerOpen {
         until: Instant,
     },
@@ -54,6 +57,7 @@ impl Skip {
             Self::KeyDisabled => "key_disabled",
             Self::Missing => "missing",
             Self::Unavailable => "unavailable",
+            Self::TooLarge => "too_large",
             Self::BreakerOpen { .. } => "breaker_open",
             Self::Cooldown { .. } => "cooldown",
             Self::Quota { limit, .. } => match limit {

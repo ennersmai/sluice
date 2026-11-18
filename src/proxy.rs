@@ -363,7 +363,10 @@ async fn forward(
                 apply_failure(state, entry, Class::ServerError, None, "timeout");
                 continue;
             };
-            if looks_too_large(&body) {
+            if let Some(kind) = too_large_kind(&body) {
+                if kind == TooLargeKind::Size {
+                    learn_ceiling(state, provider, entry.model, req.estimate);
+                }
                 track.attempt(provider, entry.model, key, "too_large", attempt_start);
                 last = Some(LastError {
                     status,
@@ -399,6 +402,7 @@ async fn forward(
                 _ => None,
             };
             let reason = if class == Class::TooLarge {
+                learn_ceiling(state, provider, entry.model, req.estimate);
                 "too_large".to_string()
             } else {
                 format!("http_{}", status.as_u16())
@@ -1222,10 +1226,19 @@ fn header_hint(headers: &HeaderMap) -> Option<Duration> {
     .map(limiter::clamp_hint)
 }
 
-/// Whether a 400/422 error body says the request exceeds a context or size
-/// limit. Looks at the error body only, bounded, case-insensitive.
-fn looks_too_large(body: &[u8]) -> bool {
-    const PHRASES: &[&str] = &[
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TooLargeKind {
+    /// The request exceeds a context or size limit: worth learning a ceiling.
+    Size,
+    /// Fails over like a size refusal but is not about size.
+    Other,
+}
+
+/// Whether a 400/422 error body says the request is refused in a way another
+/// route may serve, and which kind. Looks at the error body only, bounded,
+/// case-insensitive.
+fn too_large_kind(body: &[u8]) -> Option<TooLargeKind> {
+    const SIZE: &[&str] = &[
         "context_length_exceeded",
         "maximum context length",
         "context length",
@@ -1233,13 +1246,30 @@ fn looks_too_large(body: &[u8]) -> bool {
         "too many tokens",
         "reduce the length",
         "request too large",
-        // Gemini rejects history whose tool calls came from another model
-        // (no thought_signature). Another route can serve the request.
-        "thought_signature",
     ];
+    // Gemini rejects history whose tool calls came from another model
+    // (no thought_signature). Another route can serve the request.
+    const OTHER: &[&str] = &["thought_signature"];
     let head = body.get(..body.len().min(16 * 1024)).unwrap_or_default();
     let text = String::from_utf8_lossy(head).to_ascii_lowercase();
-    PHRASES.iter().any(|p| text.contains(p))
+    let any = |list: &[&str]| list.iter().any(|p| text.contains(p));
+    if any(SIZE) {
+        Some(TooLargeKind::Size)
+    } else if any(OTHER) {
+        Some(TooLargeKind::Other)
+    } else {
+        None
+    }
+}
+
+/// Remember that `model` refused a request of `estimate` tokens.
+fn learn_ceiling(state: &AppState, provider: &Provider, model: &str, estimate: u64) {
+    if let Some(c) = state.limiter.record_ceiling(&provider.id, model, estimate) {
+        crate::elog!(
+            "warn: size ceiling learned provider={} model={model} ceiling={c} tokens (estimate)",
+            provider.id
+        );
+    }
 }
 
 fn remaining_hints(headers: &HeaderMap) -> RemainingHints {

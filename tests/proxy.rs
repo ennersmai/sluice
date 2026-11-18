@@ -1118,15 +1118,19 @@ async fn t27_413_fails_over_in_a_pool_without_cooldown_and_explicit_is_unchanged
     let beta = Mock::start(Reply::json(200, "{\"ok\":true}")).await;
     let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
 
-    for _ in 0..2 {
-        let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
-        assert_eq!(r.status(), 200);
-        assert_eq!(header(&r, "x-router-provider"), "beta");
-        assert_eq!(header(&r, "x-router-attempts"), "2");
-    }
-    // No cooldown: alpha was asked both times.
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    // No cooldown: after clearing the learned ceiling alpha is asked again.
+    assert_eq!(admin(router, "/admin/ceilings/clear").await.status(), 200);
+    let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+    assert_eq!(header(&r, "x-router-attempts"), "2");
     assert_eq!(alpha.calls().len(), 2);
 
+    // (Learned ceilings apply to explicit routes too; clear it to see the
+    // raw upstream answer.)
+    admin(router, "/admin/ceilings/clear").await;
     let r = post_json(
         router,
         &json!({"model": "alpha/vendor/model-a", "messages": []}),
@@ -1159,6 +1163,86 @@ async fn t27_context_length_400_fails_over_in_a_pool() {
     assert_eq!(r.status(), 200);
     assert_eq!(header(&r, "x-router-provider"), "beta");
     assert_eq!(header(&r, "x-router-attempts"), "2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn learned_ceiling_skips_larger_requests_without_an_upstream_call() {
+    let alpha = Mock::start(Reply::Sequence(vec![
+        Reply::json(413, "{\"error\":{\"message\":\"too big\"}}"),
+        Reply::json(200, "{}"),
+    ]))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    let big = |n: usize| json!({"model": "coder", "messages": [{"role": "user", "content": "x".repeat(n)}]});
+
+    let r = post_json(router, &big(40_000)).await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "2");
+    assert_eq!(alpha.calls().len(), 1);
+
+    // A larger request skips alpha with no upstream call.
+    let r = post_json(router, &big(60_000)).await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(header(&r, "x-router-attempts"), "1");
+    assert_eq!(alpha.calls().len(), 1);
+
+    let status = get_json(router, "/status").await;
+    let m = &status["providers"][0]["models"][0];
+    assert_eq!(m["model"], "vendor/model-a");
+    assert!(m["ceiling_tokens"].as_u64().unwrap() > 10_000);
+    assert_eq!(m["ceiling_source"], "learned");
+
+    // A smaller request still goes there.
+    let r = post_json(router, &big(100)).await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+
+    // Clearing forgets the ceiling.
+    let r = admin(router, "/admin/ceilings/clear?provider=alpha").await;
+    assert_eq!(r.status(), 200);
+    let r = post_json(router, &big(60_000)).await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thought_signature_400_fails_over_but_learns_no_ceiling() {
+    let alpha = Mock::start(Reply::json(
+        400,
+        "{\"error\":{\"message\":\"missing thought_signature in function call\"}}",
+    ))
+    .await;
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), "")).await;
+    for _ in 0..2 {
+        let r = post_json(router, &json!({"model": "coder", "messages": []})).await;
+        assert_eq!(header(&r, "x-router-provider"), "beta");
+        assert_eq!(header(&r, "x-router-attempts"), "2");
+    }
+    assert_eq!(alpha.calls().len(), 2);
+    let status = get_json(router, "/status").await;
+    assert!(status["providers"][0]["models"][0]["ceiling_tokens"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_max_input_tokens_skips_from_the_first_request() {
+    let beta = Mock::start(Reply::json(200, "{}")).await;
+    let extra = "[provider.model_limits.\"fallback-model\"]
+max_input_tokens = 100
+";
+    let router = start_router(config(&beta.base_url(), &beta.base_url(), extra)).await;
+    let r = post_json(
+        router,
+        &json!({"model": "beta/fallback-model", "messages": []}),
+    )
+    .await;
+    assert_eq!(r.status(), 503);
+    assert_eq!(beta.calls().len(), 0);
+    let body = error_body(r).await;
+    assert!(body.to_string().contains("too_large"));
+    let status = get_json(router, "/status").await;
+    let m = &status["providers"][1]["models"][0];
+    assert_eq!(m["ceiling_tokens"], 100);
+    assert_eq!(m["ceiling_source"], "config");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -34,6 +34,8 @@ tpm = 0
 tpd = 0
 [provider.model_limits."vendor/example-model:free"]   # optional per-model override
 rpm = 0
+# max_input_tokens = 64000  # largest request (sluice's pre-flight estimate) this model accepts, 0 = unknown;
+                            # sluice also learns this from "too large" refusals and keeps the lower value
 
 [[provider]]
 id = "or-paid"              # paid providers are reachable only by explicit route

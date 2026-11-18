@@ -26,7 +26,17 @@ struct File {
     days: Vec<Day>,
     hourly: Vec<Hour>,
     cooldowns: Vec<Cooldown>,
+    /// Learned size ceilings; absent in files written before they existed.
+    #[serde(default)]
+    ceilings: Vec<Ceiling>,
     spend: PaidSpend,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Ceiling {
+    provider: String,
+    model: String,
+    tokens: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +131,15 @@ impl From<Snapshot> for File {
                     step: c.step,
                 })
                 .collect(),
+            ceilings: s
+                .ceilings
+                .into_iter()
+                .map(|(provider, model, tokens)| Ceiling {
+                    provider,
+                    model,
+                    tokens,
+                })
+                .collect(),
             spend: PaidSpend {
                 day: s.spend.day,
                 usd: s.spend.usd,
@@ -155,6 +174,11 @@ impl From<File> for Snapshot {
                     until_unix: c.until_unix,
                     step: c.step,
                 })
+                .collect(),
+            ceilings: f
+                .ceilings
+                .into_iter()
+                .map(|c| (c.provider, c.model, c.tokens))
                 .collect(),
             spend: Spend {
                 day: f.spend.day,
@@ -217,6 +241,7 @@ pub fn load(state: &AppState) {
             state.limiter.restore(
                 f.into(),
                 &|id| config.provider(id).map(|p| p.reset_utc_hour),
+                &|id, model| config.provider(id).is_some_and(|p| p.allows_model(model)),
                 Instant::now(),
             );
         }
@@ -277,6 +302,8 @@ mod tests {
         };
         a.limiter
             .record_usage(p, 0, "m", usage, Default::default(), now);
+        a.limiter.record_ceiling("p", "m", 5000);
+        assert_eq!(a.limiter.snapshot(now).ceilings.len(), 1);
         save(&a).unwrap();
         assert!(!path.with_extension("json.tmp").exists());
 
@@ -284,6 +311,10 @@ mod tests {
         load(&b);
         assert_eq!(b.limiter.snapshot(now).days, a.limiter.snapshot(now).days);
         assert_eq!(b.limiter.hourly("p", now), a.limiter.hourly("p", now));
+        assert_eq!(
+            b.limiter.snapshot(now).ceilings,
+            a.limiter.snapshot(now).ceilings
+        );
         let _ = fs::remove_file(&path);
     }
 }

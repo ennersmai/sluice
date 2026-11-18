@@ -20,7 +20,9 @@ use serde_json::{Map, Value, json};
 use crate::AppState;
 use crate::config::{LimitScope, Limits, Provider};
 use crate::error::ApiError;
-use crate::limiter::{HOURLY_BUCKETS, ProviderView, ScopeKey, unix_secs};
+use crate::limiter::{
+    CREDIT_GUARD_FRACTION, CreditStatus, HOURLY_BUCKETS, ProviderView, ScopeKey, unix_secs,
+};
 
 /// Interval of the shared `counters` event.
 const COUNTERS_INTERVAL: Duration = Duration::from_secs(2);
@@ -229,7 +231,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 fn limits_json(l: &Limits) -> Value {
-    json!({"rpm": l.rpm, "rpd": l.rpd, "tpm": l.tpm, "tpd": l.tpd})
+    json!({"rpm": l.rpm, "rpd": l.rpd, "tpm": l.tpm, "tpd": l.tpd, "tpmo": l.tpmo})
 }
 
 fn scope_name(s: LimitScope) -> &'static str {
@@ -244,15 +246,24 @@ fn expires_ms(at: Instant, now: Instant) -> u64 {
     u64::try_from(at.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Overall provider state and when it ends: `paused`, `key_disabled` (every
-/// key), `breaker_open`, `cooling` (a provider-wide cooldown, or every key
-/// cooling) or `ok`.
-fn provider_state(p: &Provider, v: &ProviderView, now: Instant) -> (&'static str, Option<Instant>) {
+/// Overall provider state and when it ends, first match wins: `paused`,
+/// `payment_required` (402 until cleared), `credit_exhausted` (until the
+/// credit reset), `key_disabled` (every key), `breaker_open`, `cooling` (a
+/// provider-wide cooldown, or every key cooling) or `ok`.
+fn provider_state(
+    p: &Provider,
+    v: &ProviderView,
+    credit_until: Option<Instant>,
+    now: Instant,
+) -> (&'static str, Option<Instant>) {
     if v.paused {
         return ("paused", None);
     }
     if v.payment_required {
         return ("payment_required", None);
+    }
+    if let Some(until) = credit_until {
+        return ("credit_exhausted", Some(until));
     }
     if !p.keys.is_empty() && v.disabled_keys.len() >= p.keys.len() {
         return ("key_disabled", None);
@@ -322,7 +333,12 @@ fn hourly_json(state: &AppState, id: &str, now: Instant, unix: u64) -> Vec<Value
 /// per-model rows, cooldown list and hourly history are added.
 fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail: bool) -> Value {
     let view = state.limiter.provider_view(p, now);
-    let (name, until) = provider_state(p, &view, now);
+    let credit = state.limiter.credit_status(p, now);
+    // The credit reset as an `Instant`, when the guard has been reached.
+    let credit_until = credit
+        .filter(|c| c.exhausted)
+        .map(|c| now + Duration::from_secs(c.resets_at.saturating_sub(unix)));
+    let (name, until) = provider_state(p, &view, credit_until, now);
     let ev = state.events.provider_events(&p.id);
     let day_start_hour = unix / 86_400 * 24;
     let hourly = state.limiter.hourly(&p.id, now);
@@ -335,15 +351,19 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
     let mut out = json!({
         "id": p.id,
         "paid": p.paid,
+        "billing": p.billing.name(),
         "state": name,
         "expires_in_ms": until.map(|u| expires_ms(u, now)),
         "requests_minute": view.requests_minute,
         "requests_day": view.requests_day,
         "tokens_minute": view.tokens_minute,
         "tokens_day": view.tokens_day,
+        "tokens_month": view.tokens_month,
         "tokens_in_today": tin,
         "tokens_out_today": tout,
         "payment_required": view.payment_required,
+        "spend_today_usd": state.limiter.provider_spend_today(&p.id, now),
+        "credit": credit.map(credit_json),
         "ttft_ms": {"median": ev.ttft.median, "p95": ev.ttft.p95, "samples": ev.ttft.samples},
         "last_error": ev.last_error.as_ref().map(|e| e.to_json()),
     });
@@ -436,6 +456,7 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
                 "scope": scope_name(p.limits.scope),
                 "rpm": p.limits.limits.rpm, "rpd": p.limits.limits.rpd,
                 "tpm": p.limits.limits.tpm, "tpd": p.limits.limits.tpd,
+                "tpmo": p.limits.limits.tpmo,
             }),
         );
         o.insert("models".to_string(), Value::Array(models));
@@ -445,6 +466,18 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
         );
     }
     out
+}
+
+/// A credit provider's period: amounts in USD, times in Unix ms.
+fn credit_json(c: CreditStatus) -> Value {
+    json!({
+        "usd": c.credit_usd,
+        "spent_usd": c.spent_usd,
+        "guard_usd": c.credit_usd * CREDIT_GUARD_FRACTION,
+        "period_start_ms": c.period_start.saturating_mul(1000),
+        "resets_at_ms": c.resets_at.saturating_mul(1000),
+        "exhausted": c.exhausted,
+    })
 }
 
 /// The `/status` body (`detail`) and the `counters` event payload (without
@@ -483,6 +516,11 @@ fn snapshot(state: &AppState, detail: bool) -> Value {
             "cap_usd": state.config.paid_daily_cap_usd,
         }),
     );
+    put(
+        "spend_today_usd",
+        json!(state.limiter.total_spend_today(now)),
+    );
+    put("sticky_sessions", json!(state.sticky.len(now)));
     put("providers", Value::Array(providers));
     if detail {
         put("version", json!(env!("CARGO_PKG_VERSION")));

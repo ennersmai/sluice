@@ -2503,3 +2503,56 @@ async fn derived_session_key_sticks_without_a_header() {
     .await;
     assert_eq!(header(&r, "x-router-provider"), "alpha");
 }
+
+// ---------------------------------------------------------------------------
+// SL-13: /status reports billing, spend, credit and sticky sessions
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_billing_spend_credit_and_sticky_sessions() {
+    let alpha = Mock::start(usage_reply()).await;
+    let beta = Mock::start(usage_reply()).await;
+    let extra = "billing = \"credit\"\ncredit_usd = 1.0\ncredit_reset_day = 1\n[provider.prices.\"fallback-model\"]\nin_per_mtok = 1000.0\nout_per_mtok = 0.0\n";
+    let router = start_router(config(&alpha.base_url(), &beta.base_url(), extra)).await;
+    let body = json!({"model": "coder", "messages": []});
+
+    let r = post_with(router, &body, &[("x-session-id", "s1")]).await;
+    assert_eq!(header(&r, "x-router-provider"), "alpha");
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/pause").await.status(),
+        200
+    );
+    let r = post_with(router, &body, &[("x-session-id", "s2")]).await;
+    assert_eq!(header(&r, "x-router-provider"), "beta");
+    assert_eq!(
+        admin(router, "/admin/provider/alpha/resume").await.status(),
+        200
+    );
+
+    let status = get_json(router, "/status").await;
+    let now_ms = status["now_ms"].as_u64().unwrap();
+    let alpha_j = &status["providers"][0];
+    let beta_j = &status["providers"][1];
+    let money_j = &status["providers"][2];
+    assert_eq!(alpha_j["billing"], "free");
+    assert_eq!(alpha_j["spend_today_usd"].as_f64(), Some(0.0));
+    assert!(alpha_j["credit"].is_null());
+    assert_eq!(alpha_j["tokens_month"].as_u64(), Some(15));
+    assert_eq!(alpha_j["payment_required"], false);
+    assert_eq!(beta_j["billing"], "credit");
+    assert_eq!(beta_j["state"], "ok");
+    let credit = &beta_j["credit"];
+    assert!(credit["spent_usd"].as_f64().unwrap() > 0.0);
+    assert_eq!(credit["usd"].as_f64(), Some(1.0));
+    assert!((credit["guard_usd"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+    assert!(credit["resets_at_ms"].as_u64().unwrap() > now_ms);
+    assert!(credit["period_start_ms"].as_u64().unwrap() <= now_ms);
+    assert_eq!(credit["exhausted"], false);
+    assert!(status["providers"][0]["limits"]["tpmo"].is_null());
+    let beta_spend = beta_j["spend_today_usd"].as_f64().unwrap();
+    assert!(beta_spend > 0.0);
+    assert!((status["spend_today_usd"].as_f64().unwrap() - beta_spend).abs() < 1e-12);
+    assert!(status["sticky_sessions"].as_u64().unwrap() >= 1);
+    assert_eq!(money_j["billing"], "paid");
+    assert!(status["paid"]["cap_usd"].is_number());
+}

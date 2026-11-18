@@ -145,3 +145,28 @@ Mistral prices (USD per million tokens, input / output), from docs.mistral.ai/in
 - Colour palette verified: 12 distinct non-status hues assigned by config order
 
 ---
+
+## SL-16a: Fix two provider colours that read as status colours (completed 2026-11-19)
+
+### Files changed
+- ui/index.html: Changed two CSS custom properties in the `:root` block
+
+### Changes
+- `--prov-4`: `#f97316` (bright orange, reads as warning/amber) → `#94a3b8` (slate)
+- `--prov-7`: `#fda4af` (rose/reddish pink, reads as error/red) → `#818cf8` (indigo)
+- Updated their comments to "slate" and "indigo" respectively
+
+### Test results
+- cargo fmt --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo test --locked: 167 tests PASS (109 unit + 5 main + 1 bench + 2 dashboard + 4 health + 46 proxy)
+- T25 dashboard tests pass: no external URLs, file size under 60 KB
+- `grep -ciE "\-\-prov-[0-9]+:#(f97316|fda4af)" ui/index.html` → 0 (confirms old colours removed)
+
+### Verification
+- Only ui/index.html was modified
+- No Rust files changed
+- No status colours (--ok, --cooling, --bad, --paused, --missing) were touched
+- All 167 tests pass
+
+---

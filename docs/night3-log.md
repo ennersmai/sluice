@@ -287,3 +287,10 @@ All grep checks from card pass:
 - **Tests:** `tpmo_blocks_until_the_month_boundary`, `tpmo_month_counter_survives_restart` (limiter).
 - **Suite:** fmt, clippy -D warnings clean; 183 passed (121 unit + 5 + 1 + 2 + 4 + 50 proxy).
 - **Adapted:** test anchor is 2026-11-20 12:00 UTC rather than midnight, so `until` checks a non-trivial distance. Remaining-header hints do not touch the month counter.
+
+## SL-09: A 402 disables the whole provider until cleared
+- **Files:** src/proxy.rs, src/select.rs, src/limiter.rs, src/state.rs, src/status.rs, tests/proxy.rs
+- **What:** `Class::PaymentRequired` for 402 (401 alone stays `KeyRejected`). `apply_failure` notes the error and calls `limiter.block_payment(provider)`; on a new block logs `error: provider disabled until cleared on the dashboard provider=.. key=.. model=.. (upstream 402 payment required)` and publishes `route_state(.., "payment_required")`. `Skip::PaymentRequired` ("payment_required", no `until`), checked right after `paused`. `State.payment_required` set, `ProviderView.payment_required`, `Snapshot.payment_required` persisted as `payment_required` (`#[serde(default)]`), restored for known providers. `clear_cooldowns` does not touch it. New `POST /admin/provider/{id}/payment/clear` -> `{"provider", "cleared"}` (404 for unknown id). `/status` provider state `payment_required` after paused; `provider_json` adds `payment_required`.
+- **Tests:** `payment_required_402_disables_the_whole_provider_until_cleared`, `payment_required_block_survives_restart`; `t8_401_disables_the_key_and_the_next_key_is_used` unchanged and green.
+- **Suite:** fmt, clippy -D warnings clean; 185 passed (121 unit + 5 + 1 + 2 + 4 + 52 proxy).
+- **Adapted:** the clear handler logs through `elog!` (the pause handler uses `eprintln!`), so the line also reaches the log file.

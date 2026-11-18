@@ -39,6 +39,9 @@ struct File {
     /// Month (`tpmo`) token counters.
     #[serde(default)]
     months: Vec<Month>,
+    /// Providers blocked by a 402 until cleared.
+    #[serde(default)]
+    payment_required: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,6 +205,7 @@ impl From<Snapshot> for File {
                     tokens: m.tokens,
                 })
                 .collect(),
+            payment_required: s.payment_required,
         }
     }
 }
@@ -289,6 +293,7 @@ impl From<File> for Snapshot {
                     tokens: m.tokens,
                 })
                 .collect(),
+            payment_required: f.payment_required,
         }
     }
 }

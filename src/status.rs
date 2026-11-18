@@ -41,6 +41,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/admin/provider/{id}/resume", post(resume))
         .route("/admin/cooldowns/clear", post(clear_cooldowns))
         .route("/admin/ceilings/clear", post(clear_ceilings))
+        .route("/admin/provider/{id}/payment/clear", post(clear_payment))
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -116,6 +117,23 @@ fn set_paused(state: &AppState, id: &str, paused: bool) -> Result<Json<Value>, A
         .events
         .route_state(&provider.id, None, None, name, None);
     Ok(Json(json!({"provider": provider.id, "paused": paused})))
+}
+
+/// `POST /admin/provider/{id}/payment/clear`: lift a 402 block.
+async fn clear_payment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let provider = known_provider(&state, &id)?;
+    let cleared = state.limiter.clear_payment(&provider.id);
+    crate::elog!(
+        "warn: provider {} payment block cleared by admin",
+        provider.id
+    );
+    state
+        .events
+        .route_state(&provider.id, None, None, "cleared", None);
+    Ok(Json(json!({"provider": provider.id, "cleared": cleared})))
 }
 
 /// The validated `?provider=id` of an admin request.
@@ -233,6 +251,9 @@ fn provider_state(p: &Provider, v: &ProviderView, now: Instant) -> (&'static str
     if v.paused {
         return ("paused", None);
     }
+    if v.payment_required {
+        return ("payment_required", None);
+    }
     if !p.keys.is_empty() && v.disabled_keys.len() >= p.keys.len() {
         return ("key_disabled", None);
     }
@@ -322,6 +343,7 @@ fn provider_json(state: &AppState, p: &Provider, now: Instant, unix: u64, detail
         "tokens_day": view.tokens_day,
         "tokens_in_today": tin,
         "tokens_out_today": tout,
+        "payment_required": view.payment_required,
         "ttft_ms": {"median": ev.ttft.median, "p95": ev.ttft.p95, "samples": ev.ttft.samples},
         "last_error": ev.last_error.as_ref().map(|e| e.to_json()),
     });

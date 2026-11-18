@@ -40,6 +40,8 @@ pub enum Skip {
     },
     /// The request is private and the provider trains on input.
     Privacy,
+    /// The provider answered 402: out of credit until the owner clears it.
+    PaymentRequired,
     /// A credit provider's spend has reached the guard fraction (90%) of its
     /// credit limit. `until` is when the credit period resets.
     CreditExhausted {
@@ -75,6 +77,7 @@ impl Skip {
                 QuotaKind::Tpmo => "quota_tpmo",
             },
             Self::Privacy => "private_excluded",
+            Self::PaymentRequired => "payment_required",
             Self::CreditExhausted { .. } => "credit_exhausted",
         }
     }

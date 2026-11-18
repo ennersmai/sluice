@@ -142,8 +142,10 @@ enum Class {
     /// Connect error, timeout or broken body: counts toward the provider's
     /// breaker.
     Unreachable,
-    /// 401 or 402: the key is disabled until restart.
+    /// 401: the key is disabled until restart.
     KeyRejected,
+    /// 402: the whole provider is out of credit until cleared.
+    PaymentRequired,
     /// 403: this (provider, model) is unavailable until restart.
     Forbidden,
     Missing,
@@ -155,7 +157,8 @@ fn classify(status: StatusCode, is_pool: bool) -> Class {
         429 => Class::RateLimited,
         413 if is_pool => Class::TooLarge,
         500 | 502 | 503 | 504 => Class::ServerError,
-        401 | 402 => Class::KeyRejected,
+        401 => Class::KeyRejected,
+        402 => Class::PaymentRequired,
         403 => Class::Forbidden,
         404 if is_pool => Class::Missing,
         _ => Class::Passthrough,
@@ -713,6 +716,7 @@ fn apply_failure(
             | Class::ServerError
             | Class::Unreachable
             | Class::KeyRejected
+            | Class::PaymentRequired
             | Class::Forbidden
             | Class::Missing
     ) {
@@ -764,6 +768,14 @@ fn apply_failure(
                     "error: key disabled until restart provider={provider} key={key} (upstream {detail})"
                 );
                 events.route_state(provider, None, Some(key), "key_disabled", None);
+            }
+        }
+        Class::PaymentRequired => {
+            if state.limiter.block_payment(provider) {
+                crate::elog!(
+                    "error: provider disabled until cleared on the dashboard provider={provider} key={key} model={model} (upstream 402 payment required)"
+                );
+                events.route_state(provider, None, Some(key), "payment_required", None);
             }
         }
         Class::Forbidden => {

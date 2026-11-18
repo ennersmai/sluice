@@ -2264,3 +2264,83 @@ async fn credit_seed_from_config_makes_the_provider_ineligible() {
     assert_eq!(v["error"]["routes"][0]["reason"], "credit_exhausted");
     assert!(beta.calls().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// SL-09: a 402 disables the whole provider until cleared
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn payment_required_402_disables_the_whole_provider_until_cleared() {
+    let alpha = Mock::start(Reply::Sequence(vec![
+        Reply::json(402, "{\"error\":\"insufficient credit\"}"),
+        Reply::json(200, "{\"ok\":true}"),
+    ]))
+    .await;
+    let keys = format!("{ALPHA_KEY},{BETA_KEY}");
+    let router = start_router(config_full("", &alpha.base_url(), DEAD, "", &keys)).await;
+    let body = json!({"model": "alpha/vendor/model-a", "messages": []});
+
+    // The 402 is returned and the second key is not tried.
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 402);
+    assert_eq!(header(&r, "x-router-attempts"), "1");
+
+    // Every key and model of the provider is now ineligible.
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert!(
+        v["error"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["reason"] == "payment_required"),
+        "{v}"
+    );
+    assert_eq!(alpha.calls().len(), 1);
+    let status = get_json(router, "/status").await;
+    assert_eq!(status["providers"][0]["id"], "alpha");
+    assert_eq!(status["providers"][0]["state"], "payment_required");
+    assert_eq!(status["providers"][0]["payment_required"], true);
+
+    // Clearing cooldowns does not lift it.
+    assert_eq!(admin(router, "/admin/cooldowns/clear").await.status(), 200);
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 503);
+    assert_eq!(alpha.calls().len(), 1);
+
+    // The dedicated admin endpoint does.
+    let r = admin(router, "/admin/provider/alpha/payment/clear").await;
+    assert_eq!(r.status(), 200);
+    let j: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(j["cleared"], true);
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        admin(router, "/admin/provider/nope/payment/clear")
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn payment_required_block_survives_restart() {
+    let file = temp_state_file("sl09-restart");
+    let alpha = Mock::start(Reply::json(402, "{}")).await;
+    let top = format!("state_file = '{file}'");
+    let config = config_full(&top, &alpha.base_url(), DEAD, "", ALPHA_KEY);
+    let body = json!({"model": "alpha/vendor/model-a", "messages": []});
+
+    let (router, state) = start_router_state(config.clone(), false).await;
+    assert_eq!(post_json(router, &body).await.status(), 402);
+    sluice::state::save(&state).unwrap();
+
+    let (router, _state) = start_router_state(config, true).await;
+    let r = post_json(router, &body).await;
+    assert_eq!(r.status(), 503);
+    let v = error_body(r).await;
+    assert_eq!(v["error"]["routes"][0]["reason"], "payment_required");
+    assert_eq!(alpha.calls().len(), 1);
+    let _ = std::fs::remove_file(&file);
+}

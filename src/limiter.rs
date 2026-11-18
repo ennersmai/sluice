@@ -291,6 +291,8 @@ pub struct State {
     /// Learned size ceilings (pre-flight estimate) per (provider, model).
     ceilings: HashMap<(String, String), u64>,
     paused: HashSet<String>,
+    /// Providers that answered 402: ineligible until cleared by the owner.
+    payment_required: HashSet<String>,
     requests: HashMap<RouteId, u64>,
     pool_counters: HashMap<String, usize>,
     key_counters: HashMap<String, usize>,
@@ -316,6 +318,7 @@ impl Default for State {
             route_breakers: HashMap::new(),
             ceilings: HashMap::new(),
             paused: HashSet::new(),
+            payment_required: HashSet::new(),
             requests: HashMap::new(),
             pool_counters: HashMap::new(),
             key_counters: HashMap::new(),
@@ -432,6 +435,9 @@ impl RouteView for State {
         let id = provider.id.as_str();
         if self.paused.contains(id) {
             return Some(Skip::Paused);
+        }
+        if self.payment_required.contains(id) {
+            return Some(Skip::PaymentRequired);
         }
         // Credit guard: skip if this credit provider's spend has reached the guard fraction.
         if let Some(cs) = self.credit_status(provider, now)
@@ -603,12 +609,16 @@ pub struct Snapshot {
     pub credit: Vec<(String, CreditSpend)>,
     /// Month (`tpmo`) token counters.
     pub months: Vec<MonthSnap>,
+    /// Providers blocked by a 402 until cleared.
+    pub payment_required: Vec<String>,
 }
 
 /// State of one provider, with deadlines as `Instant`s.
 #[derive(Debug, Default, Clone)]
 pub struct ProviderView {
     pub paused: bool,
+    /// Blocked by a 402 until cleared.
+    pub payment_required: bool,
     pub breaker_until: Option<Instant>,
     /// Active cooldowns, soonest expiry first.
     pub cooldowns: Vec<(ScopeKey, Instant)>,
@@ -1029,6 +1039,17 @@ impl Limiter {
             .insert((provider.to_string(), model.to_string()))
     }
 
+    /// A 402: block the whole provider until cleared. Returns true when newly
+    /// blocked. Not cleared by `clear_cooldowns` or a restart.
+    pub fn block_payment(&self, provider: &str) -> bool {
+        self.lock().payment_required.insert(provider.to_string())
+    }
+
+    /// Lift a 402 block. Returns true when one was cleared.
+    pub fn clear_payment(&self, provider: &str) -> bool {
+        self.lock().payment_required.remove(provider)
+    }
+
     pub fn set_paused(&self, provider: &str, paused: bool) {
         let mut st = self.lock();
         if paused {
@@ -1098,6 +1119,7 @@ impl Limiter {
         let id = provider.id.as_str();
         let mut view = ProviderView {
             paused: st.paused.contains(id),
+            payment_required: st.payment_required.contains(id),
             breaker_until: st
                 .breakers
                 .get(id)
@@ -1230,6 +1252,7 @@ impl Limiter {
                     tokens: b.month_tok,
                 })
                 .collect(),
+            payment_required: st.payment_required.iter().cloned().collect(),
         }
     }
 
@@ -1321,6 +1344,11 @@ impl Limiter {
             let b = st.buckets.entry(m.scope).or_default();
             b.month = m.period_start;
             b.month_tok = m.tokens;
+        }
+        for p in snap.payment_required {
+            if reset_hour(&p).is_some() {
+                st.payment_required.insert(p);
+            }
         }
     }
 }
@@ -1740,6 +1768,7 @@ mod tests {
             provider_spend: vec![],
             credit: vec![],
             months: vec![],
+            payment_required: vec![],
         };
         let reset = |id: &str| (id == "p").then_some(0u8);
         let month_start =

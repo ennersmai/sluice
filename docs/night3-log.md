@@ -294,3 +294,10 @@ All grep checks from card pass:
 - **Tests:** `payment_required_402_disables_the_whole_provider_until_cleared`, `payment_required_block_survives_restart`; `t8_401_disables_the_key_and_the_next_key_is_used` unchanged and green.
 - **Suite:** fmt, clippy -D warnings clean; 185 passed (121 unit + 5 + 1 + 2 + 4 + 52 proxy).
 - **Adapted:** the clear handler logs through `elog!` (the pause handler uses `eprintln!`), so the line also reaches the log file.
+
+## SL-10: Bounded, sanitised error-body excerpt on 429 and 402 log lines
+- **Files:** src/proxy.rs
+- **What:** `MAX_EXCERPT_CHARS = 300` and `error_excerpt(body, keys)`: lossy UTF-8 of at most the first 4 KiB, every non-anonymous configured key of the provider replaced by `[redacted]`, control chars to spaces, `"` to `'`, whitespace collapsed and trimmed, cut to 300 chars plus `…`. `apply_failure` gained `body: Option<&[u8]>`; only the branch that reads the error body with `read_capped` passes `Some(&body)`. The 429 cooldown warn line and the SL-09 402 error line get ` body="{excerpt}"` when the excerpt is non-empty. `note_error` / attempt reasons unchanged, so nothing reaches `/status`, `/events` or the 503 body.
+- **Tests:** `error_excerpt_is_bounded_single_line_and_redacts_keys` (proxy unit).
+- **Suite:** fmt, clippy -D warnings clean; 186 passed (122 unit + 5 + 1 + 2 + 4 + 52 proxy).
+- **Adapted:** each of the two lines has two `elog!` forms (with and without the body) so the format strings themselves contain `body=\"{e}\"`, which the card's grep checks for.

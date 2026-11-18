@@ -340,17 +340,17 @@ async fn forward(
                 Ok(Ok(r)) => r,
                 Ok(Err(FirstByteError::Send)) => {
                     track.attempt(provider, entry.model, key, "unreachable", attempt_start);
-                    apply_failure(state, entry, Class::Unreachable, None, "unreachable");
+                    apply_failure(state, entry, Class::Unreachable, None, "unreachable", None);
                     continue;
                 }
                 Ok(Err(FirstByteError::Body)) => {
                     track.attempt(provider, entry.model, key, "body_error", attempt_start);
-                    apply_failure(state, entry, Class::Unreachable, None, "body_error");
+                    apply_failure(state, entry, Class::Unreachable, None, "body_error", None);
                     continue;
                 }
                 Err(_) => {
                     track.attempt(provider, entry.model, key, "timeout", attempt_start);
-                    apply_failure(state, entry, Class::ServerError, None, "timeout");
+                    apply_failure(state, entry, Class::ServerError, None, "timeout", None);
                     continue;
                 }
             };
@@ -363,7 +363,7 @@ async fn forward(
             let mut headers = forwarded_response_headers(upstream.headers());
             let Ok(body) = tokio::time::timeout_at(deadline, read_capped(upstream)).await else {
                 track.attempt(provider, entry.model, key, "timeout", attempt_start);
-                apply_failure(state, entry, Class::ServerError, None, "timeout");
+                apply_failure(state, entry, Class::ServerError, None, "timeout", None);
                 continue;
             };
             if let Some(kind) = too_large_kind(&body) {
@@ -396,7 +396,7 @@ async fn forward(
             let headers = forwarded_response_headers(upstream.headers());
             let Ok(body) = tokio::time::timeout_at(deadline, read_capped(upstream)).await else {
                 track.attempt(provider, entry.model, key, "timeout", attempt_start);
-                apply_failure(state, entry, Class::ServerError, None, "timeout");
+                apply_failure(state, entry, Class::ServerError, None, "timeout", None);
                 continue;
             };
             let retry_after = match (class, hint) {
@@ -411,7 +411,7 @@ async fn forward(
                 format!("http_{}", status.as_u16())
             };
             track.attempt(provider, entry.model, key, &reason, attempt_start);
-            apply_failure(state, entry, class, retry_after, &reason);
+            apply_failure(state, entry, class, retry_after, &reason, Some(&body));
             last = Some(LastError {
                 status,
                 headers,
@@ -509,7 +509,7 @@ async fn forward(
                 Err(ChunkError::Idle) => {
                     track.attempt(provider, entry.model, key, "idle_timeout", attempt_start);
                     if class == Class::Success {
-                        apply_failure(state, entry, Class::ServerError, None, "idle_timeout");
+                        apply_failure(state, entry, Class::ServerError, None, "idle_timeout", None);
                     }
                     return Err(ApiError::new(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -524,7 +524,7 @@ async fn forward(
                 Err(ChunkError::Body) if class == Class::Success => {
                     // Nothing has reached the client yet, so this can fail over.
                     track.attempt(provider, entry.model, key, "body_error", attempt_start);
-                    apply_failure(state, entry, Class::Unreachable, None, "body_error");
+                    apply_failure(state, entry, Class::Unreachable, None, "body_error", None);
                     continue;
                 }
                 Err(ChunkError::Body) => {
@@ -693,14 +693,57 @@ async fn next_chunk(
     }
 }
 
-/// Record a retryable failure in the limiter and log the warnings.
+/// Longest upstream error-body excerpt in a log line, in chars.
+const MAX_EXCERPT_CHARS: usize = 300;
+/// Bytes of an error body looked at for the excerpt.
+const EXCERPT_SCAN_BYTES: usize = 4 * 1024;
+
+/// A bounded, single-line, sanitised excerpt of an upstream error body for
+/// the 429 and 402 log lines: configured keys redacted, control characters
+/// mapped to spaces, `"` to `'`, whitespace collapsed, at most
+/// [`MAX_EXCERPT_CHARS`] chars (with `…` when cut). Error bodies only, never
+/// request text.
+fn error_excerpt(body: &[u8], keys: &[ApiKey]) -> String {
+    let head = body
+        .get(..body.len().min(EXCERPT_SCAN_BYTES))
+        .unwrap_or_default();
+    let mut text = String::from_utf8_lossy(head).into_owned();
+    for k in keys.iter().filter(|k| !k.is_anonymous()) {
+        text = text.replace(k.expose(), "[redacted]");
+    }
+    let mapped: String = text
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let collapsed = mapped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_EXCERPT_CHARS {
+        let mut cut: String = collapsed.chars().take(MAX_EXCERPT_CHARS).collect();
+        cut.push('…');
+        cut
+    } else {
+        collapsed
+    }
+}
+
+/// Record a retryable failure in the limiter and log the warnings. `body` is
+/// the upstream error body when it was read; only the 429 and 402 lines use
+/// it, as a sanitised excerpt.
 fn apply_failure(
     state: &AppState,
     entry: &Entry<'_>,
     class: Class,
     retry_after: Option<Duration>,
     detail: &str,
+    body: Option<&[u8]>,
 ) {
+    let excerpt = || {
+        body.map(|b| error_excerpt(b, &entry.provider.keys))
+            .filter(|e| !e.is_empty())
+    };
     let provider = entry.provider.id.as_str();
     let model = entry.model;
     let key = entry
@@ -726,10 +769,15 @@ fn apply_failure(
         Class::RateLimited => {
             let scope = limiter::scope_key(entry.provider, entry.key_idx, model);
             let len = state.limiter.record_rate_limit(scope, retry_after, now);
-            crate::elog!(
-                "warn: cooldown provider={provider} key={key} model={model} for {}s (429)",
-                len.as_secs()
-            );
+            let secs = len.as_secs();
+            match excerpt() {
+                Some(e) => crate::elog!(
+                    "warn: cooldown provider={provider} key={key} model={model} for {secs}s (429) body=\"{e}\""
+                ),
+                None => crate::elog!(
+                    "warn: cooldown provider={provider} key={key} model={model} for {secs}s (429)"
+                ),
+            }
             events.route_state(provider, Some(model), Some(key), "cooldown", Some(len));
         }
         Class::ServerError => {
@@ -772,9 +820,14 @@ fn apply_failure(
         }
         Class::PaymentRequired => {
             if state.limiter.block_payment(provider) {
-                crate::elog!(
-                    "error: provider disabled until cleared on the dashboard provider={provider} key={key} model={model} (upstream 402 payment required)"
-                );
+                match excerpt() {
+                    Some(e) => crate::elog!(
+                        "error: provider disabled until cleared on the dashboard provider={provider} key={key} model={model} (upstream 402 payment required) body=\"{e}\""
+                    ),
+                    None => crate::elog!(
+                        "error: provider disabled until cleared on the dashboard provider={provider} key={key} model={model} (upstream 402 payment required)"
+                    ),
+                }
                 events.route_state(provider, None, Some(key), "payment_required", None);
             }
         }
@@ -1662,6 +1715,21 @@ fn internal(message: impl Into<String>) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_excerpt_is_bounded_single_line_and_redacts_keys() {
+        let keys = [ApiKey::new("sk-test-secret-12345678"), ApiKey::anonymous()];
+        let long = "x".repeat(2000);
+        let e = error_excerpt(long.as_bytes(), &keys);
+        assert!(e.chars().count() <= 301);
+        assert!(e.ends_with('…'));
+        assert_eq!(error_excerpt(b"a\nb\r\n\tc", &keys), "a b c");
+        let e = error_excerpt(b"{\"error\":\"bad key sk-test-secret-12345678\"}", &keys);
+        assert!(!e.contains("sk-test-secret-12345678"));
+        assert!(e.contains("[redacted]"));
+        assert_eq!(e, "{'error':'bad key [redacted]'}");
+        assert_eq!(error_excerpt(b"", &keys), "");
+    }
 
     #[test]
     fn upstream_url_handles_trailing_slash() {

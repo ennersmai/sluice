@@ -1005,6 +1005,19 @@ impl Limiter {
         len
     }
 
+    /// An admin cooldown on a whole provider for exactly `len`, replacing any
+    /// shorter provider-wide cooldown. Persisted like any other cooldown.
+    pub fn set_provider_cooldown(&self, provider: &str, len: Duration, now: Instant) -> Instant {
+        let mut st = self.lock();
+        let until = now + len;
+        let entry = st
+            .cooldowns
+            .entry(ScopeKey::provider_wide(provider))
+            .or_insert(Cooldown { until, step: 0 });
+        entry.until = entry.until.max(until);
+        entry.until
+    }
+
     /// A connect error or first-byte timeout, counted per provider. Returns true when this trips the breaker.
     pub fn record_server_failure(&self, provider: &str, now: Instant) -> bool {
         let mut st = self.lock();
@@ -1792,6 +1805,23 @@ mod tests {
         assert_eq!(skip(&l2, &c, 0, "m", 0, now).unwrap().name(), "cooldown");
         assert!(skip(&l2, &c, 1, "m", 0, now).is_none());
         assert_eq!(l2.snapshot(now).days[0].requests, 1);
+    }
+
+    #[test]
+    fn admin_provider_cooldown_blocks_every_key_and_never_shortens() {
+        let c = cfg("[provider.limits]\nscope = \"key_model\"");
+        let l = Limiter::new();
+        let now = Instant::now();
+        let long = Duration::from_secs(6 * 86_400 + 20 * 3_600);
+        let until = l.set_provider_cooldown("p", long, now);
+        assert_eq!(until, now + long);
+        assert_eq!(skip(&l, &c, 0, "m", 0, now).unwrap().name(), "cooldown");
+        assert_eq!(skip(&l, &c, 1, "m", 0, now).unwrap().name(), "cooldown");
+        assert_eq!(
+            l.set_provider_cooldown("p", Duration::from_secs(10), now),
+            now + long
+        );
+        assert_eq!(l.snapshot(now).cooldowns.len(), 1);
     }
 
     #[test]

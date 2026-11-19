@@ -44,6 +44,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/admin/cooldowns/clear", post(clear_cooldowns))
         .route("/admin/ceilings/clear", post(clear_ceilings))
         .route("/admin/provider/{id}/payment/clear", post(clear_payment))
+        .route("/admin/provider/{id}/cooldown", post(set_cooldown))
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -119,6 +120,42 @@ fn set_paused(state: &AppState, id: &str, paused: bool) -> Result<Json<Value>, A
         .events
         .route_state(&provider.id, None, None, name, None);
     Ok(Json(json!({"provider": provider.id, "paused": paused})))
+}
+
+/// `POST /admin/provider/{id}/cooldown?secs=N`: cool the whole provider for
+/// N seconds (for example when its free allowance is nearly spent). Saved to
+/// the state file at once, so it survives a restart. Lifted early by
+/// `POST /admin/cooldowns/clear?provider=id`.
+async fn set_cooldown(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    uri: Uri,
+) -> Result<Json<Value>, ApiError> {
+    let provider = known_provider(&state, &id)?;
+    let secs = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("secs=")))
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .ok_or_else(|| {
+            ApiError::bad_request("invalid_secs", "secs must be a positive whole number")
+        })?;
+    let len = Duration::from_secs(secs);
+    let now = Instant::now();
+    let until = state.limiter.set_provider_cooldown(&provider.id, len, now);
+    let remaining = until.saturating_duration_since(now);
+    crate::state::save_logged(&state);
+    crate::elog!(
+        "warn: provider {} cooled by admin for {}s",
+        provider.id,
+        remaining.as_secs()
+    );
+    state
+        .events
+        .route_state(&provider.id, None, None, "cooldown", Some(remaining));
+    Ok(Json(
+        json!({"provider": provider.id, "cooldown_secs": remaining.as_secs()}),
+    ))
 }
 
 /// `POST /admin/provider/{id}/payment/clear`: lift a 402 block.

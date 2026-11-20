@@ -1457,6 +1457,17 @@ pub struct QuotaHint {
     pub retry_delay: Option<Duration>,
 }
 
+/// True when a 429 body's text says a daily quota is spent, for providers
+/// that do not send Google's structured `QuotaFailure`: OpenRouter
+/// ("Rate limit exceeded: free-models-per-day..."), Cloudflare ("your daily
+/// free allocation of 10,000 neurons"), and "requests per day" style limits.
+pub fn daily_quota_text(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&body[..body.len().min(4096)]).to_ascii_lowercase();
+    ["per-day", "per day", "perday", "daily"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
 /// Parse a Google RPC error body (`error.details[]` with `QuotaFailure` and
 /// `RetryInfo` entries). A top-level array is unwrapped to its first element,
 /// as some OpenAI-compatible endpoints send it. Matches on the body shape
@@ -2306,6 +2317,19 @@ tpmo = 1000");
     }
 
     const GEMINI_PER_DAY: &str = r#"[{"error":{"code":429,"message":"You exceeded your current quota. Please retry in 36.5s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","quotaValue":"25"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"36s"}]}}]"#;
+
+    #[test]
+    fn daily_quota_text_matches_openrouter_and_cloudflare_only() {
+        assert!(daily_quota_text(
+            br#"{"error":{"message":"Rate limit exceeded: free-models-per-day-high-balance. ","code":429}}"#
+        ));
+        assert!(daily_quota_text(
+            br#"{"errors":[{"message":"AiError: you have used up your daily free allocation of 10,000 neurons"}]}"#
+        ));
+        assert!(!daily_quota_text(
+            br#"{"error":{"message":"Rate limit exceeded: 20 requests per minute","code":429}}"#
+        ));
+    }
 
     #[test]
     fn google_quota_failure_per_day_and_retry_info_are_parsed() {

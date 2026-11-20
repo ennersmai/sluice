@@ -425,7 +425,8 @@ async fn forward(
             let google = (class == Class::RateLimited)
                 .then(|| limiter::google_quota_hint(&body))
                 .flatten();
-            let per_day = google.is_some_and(|g| g.per_day);
+            let per_day = google.is_some_and(|g| g.per_day)
+                || (class == Class::RateLimited && limiter::daily_quota_text(&body));
             // 429 precedence: a per-day quota cools until the provider's next
             // daily reset; then the header hint, Google's RetryInfo, the
             // "try again in" body text; else the exponential backoff.
